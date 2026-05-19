@@ -1,0 +1,15 @@
+{
+  "reader": {
+    "latest_version": "1.7.0",
+    "tag": "reader-v1.7.0",
+    "metadata_url": "https://raw.githubusercontent.com/MayukXT/WAren6/reader-latest/WAren6-Reader-latest.json",
+    "changelog": "WAren6 Reader v1.7.0 - Stability release with duplicate-message prevention, Reader legacy duplicate hiding, contact and mention fixes, reactions, message ticks, and signed updater metadata."
+  },
+  "field_kit": {
+    "latest_version": "1.1.0",
+    "tag": "fieldkit-v1.1.0",
+    "release_asset": "WAren6-FieldKit-v1.1.0.zip",
+    "changelog": "WAren6 Field Kit v1.1.0 - Split release line for the extraction scripts, offline wheels, dependencies, and operator files."
+  },
+  "script_url": "https://raw.githubusercontent.com/MayukXT/WAren6/main/waren6.ps1"
+}

@@ -1,0 +1,72 @@
+name: Reader CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "waren6-reader/**"
+      - ".github/workflows/reader-ci.yml"
+      - ".github/workflows/reader-release.yml"
+  pull_request:
+    paths:
+      - "waren6-reader/**"
+      - ".github/workflows/reader-ci.yml"
+      - ".github/workflows/reader-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reader-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reader-tests:
+    name: Reader tests
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: waren6-reader/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: waren6-reader/src-tauri
+          shared-key: windows-tauri-reader
+
+      - name: Install reader dependencies
+        working-directory: waren6-reader
+        run: npm ci
+
+      - name: Check release version metadata
+        working-directory: waren6-reader
+        run: npm run check:release-version
+
+      - name: Run reader JavaScript tests
+        working-directory: waren6-reader
+        run: npm test
+
+      - name: Run reader Rust tests
+        working-directory: waren6-reader/src-tauri
+        run: cargo test
+
+      - name: Install Rust advisory scanner
+        working-directory: waren6-reader/src-tauri
+        run: cargo install cargo-audit --locked
+
+      - name: Run Rust advisory audit
+        working-directory: waren6-reader/src-tauri
+        run: cargo audit

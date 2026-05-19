@@ -1,0 +1,120 @@
+name: Field Kit Release
+
+on:
+  push:
+    tags:
+      - "fieldkit-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: field-kit-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish Field Kit assets
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read Field Kit version
+        id: versions
+        shell: pwsh
+        run: |
+          $fieldKitVersion = Get-Content .\fieldkit-version.json -Raw | ConvertFrom-Json
+          $version = $fieldKitVersion.latest_version
+          if (-not $version) { throw "fieldkit-version.json does not define latest_version" }
+
+          $releaseTag = "fieldkit-v$version"
+          if ($fieldKitVersion.tag -and $fieldKitVersion.tag -ne $releaseTag) {
+            throw "fieldkit-version.json tag $($fieldKitVersion.tag) does not match expected $releaseTag"
+          }
+          if ("${{ github.ref_type }}" -eq "tag" -and "${{ github.ref_name }}" -ne $releaseTag) {
+            throw "Tag ${{ github.ref_name }} does not match Field Kit version; expected $releaseTag"
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "release_tag=fieldkit-v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+
+      - name: Install Python test dependencies
+        run: python -m pip install cryptography
+
+      - name: Run Python regression tests
+        run: python -m unittest discover -s tests -p 'test*.py'
+
+      - name: Cache offline wheels
+        id: wheels-cache
+        uses: actions/cache@v4
+        with:
+          path: wheels
+          key: ${{ runner.os }}-py311-wheels-${{ hashFiles('requirements-lock.txt', 'airgap/prepare-wheels.ps1') }}
+          restore-keys: |
+            ${{ runner.os }}-py311-wheels-
+
+      - name: Prepare offline wheels
+        if: steps.wheels-cache.outputs.cache-hit != 'true'
+        run: powershell -ExecutionPolicy Bypass -File .\airgap\prepare-wheels.ps1
+
+      - name: Validate offline wheels
+        shell: pwsh
+        run: |
+          if (-not (Test-Path .\wheels) -or -not (Get-ChildItem .\wheels -File -Filter *.whl)) {
+            throw "No offline wheels were prepared or restored"
+          }
+
+      - name: Build field kit
+        run: powershell -ExecutionPolicy Bypass -File .\airgap\build-airgap-package.ps1 -Output dist\fieldkit -Name "WAren6-FieldKit-v${{ steps.versions.outputs.version }}"
+
+      - name: Write Field Kit release notes
+        shell: pwsh
+        run: |
+          $version = "${{ steps.versions.outputs.version }}"
+          $fieldKitVersion = Get-Content .\fieldkit-version.json -Raw | ConvertFrom-Json
+          $releaseDir = "dist\release"
+          New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+          @"
+          WAren6 Field Kit v$version
+
+          Download WAren6-FieldKit-v$version.zip to run WAren6 on Windows.
+          Keep WAren6-FieldKit-v$version.sha256.txt beside it if you want to verify the download.
+
+          $($fieldKitVersion.changelog)
+          "@ | Set-Content (Join-Path $releaseDir "release-notes.md") -Encoding utf8
+
+      - name: Publish Field Kit release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $version = "${{ steps.versions.outputs.version }}"
+          $tag = "${{ steps.versions.outputs.release_tag }}"
+          $assets = @(
+            "dist\fieldkit\WAren6-FieldKit-v$version.zip",
+            "dist\fieldkit\WAren6-FieldKit-v$version.sha256.txt"
+          )
+
+          foreach ($asset in $assets) {
+            if (-not (Test-Path $asset)) { throw "Release asset missing: $asset" }
+          }
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --target $env:GITHUB_SHA --title "WAren6 Field Kit v$version" --notes-file "dist\release\release-notes.md"
+          }

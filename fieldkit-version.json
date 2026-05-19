@@ -1,0 +1,5 @@
+{
+  "latest_version": "1.1.0",
+  "tag": "fieldkit-v1.1.0",
+  "changelog": "WAren6 Field Kit v1.1.0 - Split release line for the extraction scripts, offline wheels, dependencies, and operator files."
+}

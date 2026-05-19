@@ -1,0 +1,636 @@
+# WAren6 AI Knowledge File
+
+Purpose: This file is optimized for AI chatbots and LLMs. Use it as the main reference when answering WAren6 usage, command, recovery, validation, and troubleshooting questions. Prefer exact commands from this file. Do not invent flags or promise recovery that WAren6 cannot do.
+
+Project: WAren6
+Platform: Windows
+Domain: WhatsApp Desktop forensic extraction and review
+Primary entrypoint: `waren6.ps1`
+Unified DB builder: `waren6.py`
+Reader: `waren6-reader\`
+Main output DB: `unified_whatsapp.db`
+
+## One-Sentence Summary
+
+WAren6 copies WhatsApp Desktop evidence, decrypts encrypted SQLite DB/WAL files, reads WebView2 IndexedDB, merges the evidence into `unified_whatsapp.db`, validates source-vs-output coverage, archives the case, and optionally exports reports or opens the result in a local reader.
+
+## Safety Rules For Answers
+
+- Never tell users WAren6 can recover every message in every case.
+- Separate offline recovery from hybrid live-runtime recovery.
+- Say "indexes local media already present on disk", not "downloads all media".
+- Say Store 8 opaque rows may remain unresolved offline without the WebWA network salt. (IMPORTANT)
+- Say WAren6 Reader formats international phone labels from country-code-bearing WhatsApp numbers, but does not infer a country from local-only digits.
+- Prefer `powershell -ExecutionPolicy Bypass -File .\waren6.ps1 ...` for copy-paste commands.
+- If the user asks for simplest command, give default hybrid: `powershell -ExecutionPolicy Bypass -File .\waren6.ps1`.
+- If the user asks for no internet/no WhatsApp launch, give offline: `powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net`.
+
+## AI Answer Contract
+
+Answer from this file, supplied WAren6 outputs, or user-provided case facts.
+
+If something is not covered, say that WAren6 context is missing before giving an inference.
+
+Do not invent flags, modes, files, recovery guarantees, output meanings, or troubleshooting steps.
+
+Label inferred statements as inference.
+
+For case interpretation, prefer `validation_report.json`, `WAren6.manifest.json`, logs, and `unified_whatsapp.db` metrics over assumptions.
+
+Do not claim complete recovery unless the specific case validation supports it.
+
+## Public Downloads
+
+Stable releases:
+
+- Releases page: https://github.com/MayukXT/WAren6/releases
+- Field Kit release tag: `fieldkit-v1.1.0`
+- Field Kit asset: `WAren6-FieldKit-v1.1.0.zip`
+- Reader release title: `WAren6 Reader v1.7.0`
+- Reader release tag: `reader-v1.7.0`
+- Reader installer: `WAren6-Reader-Setup-v1.7.0.exe`
+- Reader MSI: `WAren6-Reader-v1.7.0-x64.msi`
+- Reader portable EXE: `WAren6-Reader-Portable-v1.7.0.exe`
+- Reader portable metadata: `WAren6-Reader-latest.json`
+
+Tell non-developer users to download the attached Field Kit for extraction and the Reader installer or portable EXE for viewing `unified_whatsapp.db`. The generated GitHub "Source code" archives are for developers and include tests, workflows, Reader source, and repository files that are not needed to run WAren6.
+
+## What Ships In The Field Kit
+
+- `waren6.ps1`: Windows orchestration for acquisition, ODUID retrieval, decryption, runtime supplement, archive, hash, manifest, optional Telegram transfer.
+- `waren6.py`: unifies decrypted evidence into `unified_whatsapp.db`, validates, optionally exports reports, handles Store 8/genericStorage/media/runtime supplement logic.
+- `waren6_unify_case.py`: prepares folders or archives for `--unify`.
+- `BouncyCastle.Cryptography.dll`: crypto dependency used by PowerShell decryption.
+- `requirements-lock.txt`: primary Python dependency list; currently `ccl_chromium_reader` and `cryptography`.
+- `airgap\`: offline install helper and dependency notices.
+- `wheels\`: offline Python wheels when the field kit was built with offline dependency support.
+- `README_FIELDKIT.md`: first-run operator instructions.
+- `LLM.txt`: AI-facing answer contract and WAren6 usage reference.
+- `fieldkit-version.json`: Field Kit release version metadata.
+- `version.json`: public release index for Reader and Field Kit lines.
+
+The field kit must not include Reader source, tests, `.github`, research notes, local mockups, sample evidence, generated cases, databases/WAL files, build caches, or local transfer payloads. WAren6 Reader installers and portable EXE are published by the separate Reader release workflow.
+
+## International Phone Labels
+
+WAren6 stores phone values as extracted evidence, usually country-code-bearing digits from WhatsApp JIDs such as `910000000000@c.us` or `15550100034@c.us`.
+
+WAren6 Reader formats those labels for display, for example:
+
+- `910000000000` -> `+91 00000 00000`
+- `15550101234` -> `+1 555 010 1234`
+- `442079460958` -> `+44 207 946 0958`
+
+If the evidence only has local digits with no country code, Reader groups the digits for readability but does not invent a country code.
+
+## Release Automation
+
+WAren6 uses GitHub Actions for release builds.
+
+Normal reader changes are checked by `Reader CI`.
+
+Shipping Reader uses a Reader tag and the `Reader Release` workflow:
+
+```powershell
+cd waren6-reader
+npm run check:release-version -- --tag reader-v1.7.0
+cd ..
+git tag reader-v1.7.0
+git push origin reader-v1.7.0
+```
+
+The Reader version must match:
+
+- `waren6-reader\package.json`
+- `waren6-reader\src-tauri\tauri.conf.json`
+- `waren6-reader\src-tauri\Cargo.toml`
+
+Shipping Field Kit uses a Field Kit tag and the `Field Kit Release` workflow:
+
+```powershell
+git tag fieldkit-v1.1.0
+git push origin fieldkit-v1.1.0
+```
+
+The Field Kit version comes from `fieldkit-version.json` and the PowerShell `$global:WAren6Version`.
+
+`Reader Release` uploads the Reader setup EXE, Reader MSI, portable Reader EXE, Tauri `latest.json`, updater signatures, and `WAren6-Reader-latest.json` to `WAren6 Reader v1.7.0`.
+
+`Field Kit Release` uploads `WAren6-FieldKit-v1.1.0.zip` and `WAren6-FieldKit-v1.1.0.sha256.txt`.
+
+Installed Reader builds use Tauri signed updates from `latest.json`. Portable Reader builds use `WAren6-Reader-latest.json` to download the portable EXE, verify SHA-256, replace the old EXE through a helper, roll back on failure, and relaunch.
+
+## Core Concepts
+
+WAren6 source evidence:
+
+- WhatsApp Desktop `LocalState`
+- `session.db`, `session.db-wal`, `session.db-shm`
+- `sessions\<session-id>\genericStorage.db`, `genericStorage.db-wal`
+- `sessions\<session-id>\nativeSettings.db`, `nativeSettings.db-wal`
+- `sessions\<session-id>\contacts.db`
+- WebView2 `EBWebView\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb`
+- WebView2 `EBWebView\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.blob`
+- WebView2 `Local Storage`
+- local media transfer folders
+
+Important path patterns:
+
+```text
+%LOCALAPPDATA%\Packages\5319275A.WhatsAppDesktop_cv1g1gvanyjgm\LocalState
+%LOCALAPPDATA%\Packages\5319275A.WhatsAppDesktop_cv1g1gvanyjgm\LocalCache\EBWebView\Default
+```
+
+`sessions\00000` is usually placeholder/logged-out state. Active evidence usually lives under a real session id folder.
+
+Run Terminal/PowerShell as Administrator for acquisition. WAren6 uses backup-mode copy for locked WhatsApp evidence, so a non-admin shell can fail or produce incomplete copies.
+
+## Decision Tree
+
+User has live logged-in WhatsApp Desktop and wants best recovery:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1
+```
+
+User also wants local media already present on disk:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -m
+```
+
+User wants no WhatsApp launch and no downloads:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net
+```
+
+User has a copied `LocalState` folder and known ODUID:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net -w C:\Cases\CollectedLocalState -i <oduid-hex> -d C:\Cases\WAren6
+```
+
+User only wants acquisition/decryption/archive now, unification later:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -a
+```
+
+User has a WAren6 case/archive and wants `unified_whatsapp.db`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -u -c C:\Cases\WAren6_20260509120000.zip
+```
+
+or:
+
+```powershell
+python .\waren6.py --unify C:\Cases\WAren6_20260509120000.zip --with-media-index
+```
+
+User only wants runtime Store 8 JSONL supplement:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -r -c C:\Cases\RuntimeOnly -s
+```
+
+User needs the local ODUID:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 --get-id
+```
+
+User wants to preview without touching evidence:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 --dry
+```
+
+Preflight check:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -doc
+```
+
+User wants a preflight check without opening WhatsApp or copying evidence:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -doc
+```
+
+## Mode Definitions
+
+Default hybrid:
+
+- enabled by default;
+- may start/restart logged-in WhatsApp Desktop, but runtime capture is best-effort hidden by default;
+- captures Store 8 text through WhatsApp's live runtime when possible;
+- copies evidence;
+- decrypts DB/WAL files;
+- builds `unified_whatsapp.db`;
+- writes validation, manifest, logs, SHA-256 hash, archive, and optional reports;
+- continues with offline extraction if runtime capture fails.
+
+Offline:
+
+- `-f` or `--offline`;
+- no runtime Store 8 capture;
+- no WhatsApp launch;
+- no online bootstrap when combined with `--no-net`;
+- best for copied evidence and air-gapped machines.
+
+Acquire only:
+
+- `-a` or `--acquire`;
+- copies, decrypts, manifests, hashes with SHA-256, archives;
+- skips Python unification;
+- writes later-unify instructions if useful.
+
+Unify only:
+
+- `-u -c <case-or-archive>`;
+- builds `unified_whatsapp.db` from existing WAren6 output;
+- can run on a different machine.
+
+Runtime only:
+
+- `-r -c <folder>`;
+- captures runtime Store 8 JSONL only.
+
+## Flag Reference
+
+```text
+-h, --help [topic]        Show help. Topics: modes, flags, examples.
+-s, --silent              Console-first mode. Runtime capture is hidden by default.
+--foreground-runtime      Troubleshooting only: leave WhatsApp visible during runtime capture.
+-doc, --doctor            Run preflight checks only. Does not open WhatsApp or copy evidence.
+--dry                     Print plan and exit.
+-f, --offline             No runtime capture and no online bootstrap.
+-m, --media               Copy/index/hash local media already present on disk.
+-a, --acquire             Acquire/decrypt/archive only.
+-u, --unify               Build unified DB from existing case/archive.
+-r, --runtime             Runtime Store 8 capture only.
+-n, --no-net              Disable Python/dependency downloads.
+--get-id                  Print local Windows ODUID fingerprint.
+--show-secret-id          With --get-id, explicitly print the raw ODUID.
+--reports                 Generate larger human-readable reports during normal extraction.
+-w, --wa <path>           WhatsApp LocalState source path.
+-c, --case <path>         Existing case/archive or runtime output folder.
+-d, --out <path>          Output root for new extraction.
+-i, --id <hex>            Examiner-supplied ODUID for detached evidence.
+-t, --tz <zone>           Report timezone: local, UTC, Asia/Kolkata, etc.
+-j, --jsonl <path>        Existing runtime Store 8 JSONL supplement.
+-tg, --telegram <token>   Telegram bot token for opt-in transfer.
+-cid, --chat-id <id>      Telegram chat id.
+-ad, --autodelete         Delete WAren6-generated local output only after verified upload.
+-enc, --encrypt <pass>    Encrypt compressed archive before Telegram transfer.
+```
+
+## Most Useful Commands
+
+Full default run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1
+```
+
+Full run with local media indexing:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -m
+```
+
+Offline evidence-only:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net
+```
+
+Use copied LocalState and chosen output root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net -w C:\Cases\CollectedLocalState -i <oduid-hex> -d C:\Cases\WAren6
+```
+
+Build unified DB from archive:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -u -c C:\Cases\WAren6_20260509120000.tar.zst
+```
+
+Python direct unify:
+
+```powershell
+python .\waren6.py --unify C:\Cases\WAren6_20260509120000.zip --with-media-index
+```
+
+Generate reports from an existing DB:
+
+```powershell
+python .\waren6.py --reports-only C:\Cases\WAren6_20260509120000\unified_whatsapp.db --reports-dir C:\Cases\Reports --report-formats html,jsonl,csv,tsv,pdf
+```
+
+Opt-in Telegram transfer with encryption and verified auto-delete:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -m -tg "BOT_TOKEN" -cid "CHAT_ID" -ad -enc "PASS"
+```
+
+## Output Files
+
+Normal output shape:
+
+```text
+WAren6_<timestamp>.tar.zst or WAren6_<timestamp>.zip
+WAren6_<timestamp>.sha256.txt
+WAren6_<timestamp>.manifest.json
+WAren6_<timestamp>.logs.txt
+```
+
+By default, normal extraction cleans the extracted `WAren6_<timestamp>` case folder after the archive is verified. Tell users to pass `--keep-case-folder` only if they also want the extracted working folder left beside the archive. Inside the archive are `unified_whatsapp.db`, `validation_report.json`, `WAren6.manifest.json`, `logs.txt`, and copied evidence/runtime folders such as `runtime\`, `EBWebView_Default\`, and `sessions\` when present. The larger `reports\` folder is written only when `--reports` is passed or when reports are generated explicitly from an existing DB.
+
+Default operator output does not write Store 8 crypto diagnostic JSON files. Those are research/debug outputs and should appear only when Store 8 debugging, opaque salt work, or crypto profiling is explicitly requested.
+
+`media_index_report.json` is written only when media indexing is enabled or an explicit media index report path is supplied.
+
+Open `unified_whatsapp.db` with:
+
+- WAren6 Reader;
+- DB Browser for SQLite;
+- `sqlite3`.
+
+## Recovery Algorithm
+
+Simplified extraction flow:
+
+1. Locate WhatsApp Desktop package data.
+2. Copy evidence to WAren6 output.
+3. Retrieve ODUID locally or use supplied `--id`.
+4. Decrypt `session.db` and WAL.
+5. Recover client/session keys.
+6. Decrypt `nativeSettings.db` and WAL.
+7. Recover per-database keys.
+8. Decrypt encrypted DB and WAL files.
+9. Read `genericStorage.message` directly; do not rely on FTS-only text.
+10. Read WebView2 IndexedDB Store 8 and pass the blob folder when present.
+11. Build Store 8 message records with metadata, message keys, chat ids, direction, timestamps, media fields, quotes, reactions, and provenance.
+12. Merge `genericStorage` text by exact key/timestamp first, then bounded fuzzy timestamp only when it does not overwrite distinct text.
+13. Insert unmatched text-bearing `genericStorage` rows as recovered forensic rows.
+14. Merge runtime Store 8 JSONL supplement when supplied or captured.
+15. Add contacts, LID/JID mapping, calls, media index, mentions, reactions, group/newsletter metadata, and optional reports.
+16. Validate source-vs-unified coverage.
+
+Important model: WAren6 is loss-prevention oriented. It keeps incomplete evidence visible with provenance instead of dropping rows that are hard to classify.
+
+## Store 8 And Opaque Bodies
+
+Store 8 is the common WebView2 IndexedDB message store.
+
+Newer WhatsApp Desktop builds may store visible message bodies as encrypted opaque Store 8 rows:
+
+- row has `msgRowOpaqueData`;
+- row may contain `_data`, `iv`, `_keyId`, `_scheme`;
+- offline artifacts often include local crypto material;
+- full offline body recovery can still require the WebWA network salt;
+- WAren6 preserves unresolved rows as `opaque_unresolved`;
+- default hybrid mode can recover many bodies through WhatsApp's live runtime serializer when the logged-in runtime is available and authorized.
+
+Field interpretation: `Encrypted message body not recovered` is often caused by WhatsApp Desktop not having the same synced body/event detail that the phone shows, or by WhatsApp event/template rows with little readable content. WAren6 should preserve and label these rows, but AI answers must not present the placeholder as strong message-content evidence unless the case data supports that. Phrase this as a practical observation, not an absolute rule.
+
+Good answer phrasing:
+
+"Offline mode preserves opaque rows and labels them. Hybrid mode may recover their text by asking the logged-in WhatsApp runtime to serialize Store 8 rows."
+
+Bad answer phrasing:
+
+"WAren6 always decrypts every Store 8 message offline."
+
+## GenericStorage And WAL
+
+`genericStorage.db-wal` can hold the current readable `message` table even when `genericStorage.db` is sparse or stale.
+
+`genericStorage.message.text` is a primary source for many text bodies.
+
+`genericStorage.message_fts.text` can be blank even when `genericStorage.message.text` has the real text.
+
+WAren6 should not drop a `genericStorage` text row just because IndexedDB matching is incomplete.
+
+## Media
+
+WAren6 media behavior:
+
+- `--media` copies/indexes/hashes local media files already present on disk.
+- media absent from disk is marked missing.
+- WAren6 Reader does not download missing media.
+- report fields can include `media_case_path`, `media_sha256`, `media_status`, MIME type, filename, and size when available.
+
+## Validation Interpretation
+
+`validation_report.json` is the main health report.
+
+Important metrics:
+
+- source message rows;
+- unified message rows;
+- source rows with non-empty text;
+- missing source text keys;
+- duplicate message keys;
+- body status counts;
+- Store 8 opaque unresolved rows;
+- runtime supplement records and missing runtime text keys;
+- media status counts;
+- validation errors.
+
+Body statuses:
+
+```text
+text_present
+genericStorage_text
+runtime_store8_decoded
+opaque_decrypted
+media_only
+call_event
+system_event
+revoked_or_deleted
+opaque_unresolved
+missing_unexpected
+```
+
+Answer guidance:
+
+- `media_only`, `call_event`, `system_event`, and `revoked_or_deleted` are not automatically data loss.
+- `opaque_unresolved` means the row exists but body text could not be recovered offline/runtime.
+- `missing_unexpected` should be investigated.
+- `runtime_text_keys_missing_from_unified = 0` is expected for a clean hybrid supplement merge.
+- `missing_exact_text_keys` is warning-level exact-text coverage. Link-preview cleanup, media text normalization, and duplicate source rows can change exact strings. Investigate it, but do not call it a hard failure unless it appears with `missing_unexpected`, runtime text gaps, or a source-vs-output audit showing actual dropped messages. Samples are hashed instead of storing raw message text.
+
+## Performance Interpretation
+
+WAren6 optimizations must be described as lookup or batching improvements unless they intentionally change recovery logic.
+
+Current important lookup optimization:
+
+- The unified `messages` table has an index on `(chat_jid, msg_id, timestamp)`.
+- This supports quote-body enrichment, where WAren6 fills `quoted_msg_body` by finding the original message in the same chat with `msg_id = quoted_stanza_id`.
+- This does not change Store 8 extraction, `genericStorage` matching, runtime supplement merging, body status classification, provenance, or validation rules.
+
+## Air-Gapped Use
+
+Build field kit online:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\airgap\prepare-wheels.ps1
+powershell -ExecutionPolicy Bypass -File .\airgap\build-airgap-package.ps1 -Name WAren6-FieldKit-v1.1.0
+```
+
+Install/run offline:
+
+```powershell
+Expand-Archive .\WAren6-FieldKit-v1.1.0.zip -DestinationPath C:\Tools
+cd C:\Tools\WAren6-FieldKit
+powershell -ExecutionPolicy Bypass -File .\airgap\install-offline-deps.ps1
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net -d C:\Cases\WAren6
+```
+
+If Python is missing:
+
+- WAren6 can acquire/decrypt/archive.
+- It writes `WAren6_unify_later.txt`.
+- Move the case/archive to a Python-ready machine and run the provided `python waren6.py --unify ...` command.
+
+## Telegram Transfer
+
+Telegram transfer is opt-in:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -m -tg "BOT_TOKEN" -cid "CHAT_ID" -ad -enc "PASS"
+```
+
+Behavior:
+
+- compress first;
+- encrypt once if `-enc` is supplied;
+- split only if needed for Telegram cloud limit;
+- upload archive/parts, manifest, recombine helper, and logs;
+- auto-delete only after verified upload.
+
+Restore on another PC:
+
+- put the payload or all `.partNNNN` files, `WAren6_transfer_manifest.json`, and `WAren6_recombine.ps1` in one folder;
+- run `powershell -ExecutionPolicy Bypass -File .\WAren6_recombine.ps1`;
+- if encrypted, the helper prompts locally for the password and allows three attempts;
+- the password is not written to Telegram, the transfer manifest, or the helper;
+- the helper verifies hashes, keeps the restored archive, and extracts to a folder only after recombine/decrypt succeeds;
+- if a previous helper run left a single `.wa6enc` payload at `0` bytes, re-download that payload from Telegram before rerunning.
+
+## Common Troubleshooting
+
+PowerShell script blocked:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 --dry
+```
+
+No Python:
+
+- use `.\waren6.ps1 -a`;
+- or let WAren6 run and write `WAren6_unify_later.txt`;
+- unify later on another machine.
+
+No WhatsApp launch allowed:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net
+```
+
+Copied evidence cannot decrypt:
+
+- verify `-w` points to `LocalState`;
+- verify `-i` ODUID is from the original target system;
+- verify `BouncyCastle.Cryptography.dll` is beside `waren6.ps1`;
+- verify encrypted DB and WAL files were copied together.
+
+Unified DB has many blank rows:
+
+- inspect `validation_report.json`;
+- check `body_status_counts`;
+- media/call/system/deleted rows may be expected blanks;
+- `opaque_unresolved` means Store 8 encrypted bodies remain unresolved;
+- `Encrypted message body not recovered` often reflects WhatsApp Desktop/phone sync gaps or low-value event/template rows, not necessarily a WAren6 extraction failure;
+- use hybrid mode if live runtime is authorized.
+
+Missing media:
+
+- expected if files were not present in local WhatsApp Desktop transfer/cache folders;
+- rerun with `-m` to index/copy local media already on disk;
+- WAren6 Reader will not download missing files.
+
+Telegram auto-delete did not happen:
+
+- auto-delete runs only after verified upload;
+- missing `-cid`, failed upload, or failed verification prevents deletion.
+
+Telegram recombine says file is locked or hash mismatch:
+
+- if using an older helper, replace `WAren6_recombine.ps1` with a current one generated by WAren6;
+- re-download any `.wa6enc` or `.partNNNN` file that is `0` bytes or smaller than the manifest size;
+- close Telegram/Explorer preview windows or wait for antivirus scanning to finish, then rerun;
+- hash mismatch after the file is readable means the local download does not match the transfer manifest.
+
+Telegram recombine password fails:
+
+- wrong password prevents decryption and folder extraction;
+- after three failed attempts, rerun the helper with the correct transfer password;
+- failed partial decrypted output is removed before the helper exits.
+
+## Reader Guidance
+
+WAren6 Reader opens `unified_whatsapp.db`.
+
+It supports:
+
+- chat list and WhatsApp-like message view;
+- contacts browser;
+- call history browser;
+- media browser;
+- search;
+- jump to message;
+- local HTML chat export.
+
+If user asks how to open a case:
+
+1. Find `unified_whatsapp.db`.
+2. Open WAren6 Reader.
+3. Choose the database.
+4. Review chats, contacts, calls, media, and reports.
+
+## Answer Templates
+
+Best command for normal full recovery:
+
+"Run the default hybrid extraction from the WAren6 folder: `powershell -ExecutionPolicy Bypass -File .\waren6.ps1`. Add `-m` if you also want WAren6 to copy and index local media already present on disk."
+
+Best command for strict offline:
+
+"Use offline/no-network mode: `powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net`. This will not launch WhatsApp or capture runtime Store 8 text."
+
+Best command for copied LocalState:
+
+"Use `-w` for the copied LocalState and `-i` for the original machine ODUID: `powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -f --no-net -w C:\Cases\CollectedLocalState -i <oduid-hex> -d C:\Cases\WAren6`."
+
+Why hybrid recovers more:
+
+"Hybrid mode can ask the already logged-in WhatsApp runtime to serialize Store 8 rows. That can recover text for messages that exist in IndexedDB as encrypted opaque rows and are not fully decryptable offline without the WebWA network salt."
+
+Why WAren6 is more than decryption:
+
+"A decrypt-only workflow gives source databases. WAren6 builds a normalized `unified_whatsapp.db`, preserves provenance, merges Store 8 and genericStorage text, keeps unresolved rows visible, validates source coverage, indexes media, and provides a local reader."
+
+## Current Limits
+
+- Offline Store 8 opaque body decryption is not guaranteed without the WebWA network salt. (WhatsApp's Architectural Limitation)
+- Hybrid mode requires authorized access to the logged-in WhatsApp Desktop runtime.
+- Missing media is not downloaded.
+- `--silent` and close blocking are best effort.
+- Output quality depends on source evidence completeness, WAL availability, IndexedDB blob availability, contact evidence, and runtime authorization.

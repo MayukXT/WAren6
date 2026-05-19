@@ -1,0 +1,17 @@
+{
+  "name": "waren6-reader",
+  "private": true,
+  "version": "1.7.0",
+  "type": "module",
+  "scripts": {
+    "check:release-version": "node scripts/check-release-version.mjs",
+    "tauri": "tauri",
+    "test": "node --test tests/*.test.js"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "dependencies": {
+    "@tauri-apps/plugin-dialog": "^2.7.1"
+  }
+}
