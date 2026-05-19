@@ -1,0 +1,11 @@
+{
+  "version": "1.7.0",
+  "notes": "WAren6 Reader v1.7.0 release.",
+  "pub_date": "2026-05-19T15:11:26.4720647Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRRnc5NTY2czM4anR0ODEyc3NVTkw5bzVxRjE1TEgrVWpGSm5qZzFSRmJiRlVLZ2RYWUpyVmhkRUs0Sk9wSUp0WDBzUVIxSElRQ00wMzFSRmRURnpLT1FuTXZvUHdBMFFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5MjAzNDg1CWZpbGU6V0FyZW42IFJlYWRlcl8xLjcuMF94NjQtc2V0dXAuZXhlCkV6M09PdHhHTllGY3E0a1Z0cTJpOFdobUV0TjU2RXppNE44dkxnQ0xuRjlYUXhadHRBOTd3biswSmp4NHFySVVCWWRIZE1QSFJFenJZNlpPQzNTYkN3PT0K",
+      "url": "https://github.com/MayukXT/WAren6/releases/download/reader-v1.7.0/WAren6-Reader-Setup-v1.7.0.exe"
+    }
+  }
+}

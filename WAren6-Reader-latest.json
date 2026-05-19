@@ -1,0 +1,28 @@
+{
+  "schema": "waren6.reader.release.v1",
+  "version": "1.7.0",
+  "tag": "reader-v1.7.0",
+  "release_date": "2026-05-19T15:11:26.4720647Z",
+  "release_url": "https://github.com/MayukXT/WAren6/releases/tag/reader-v1.7.0",
+  "changelog": "WAren6 Reader v1.7.0 release.",
+  "assets": {
+    "reader_setup": {
+      "name": "WAren6-Reader-Setup-v1.7.0.exe",
+      "url": "https://github.com/MayukXT/WAren6/releases/download/reader-v1.7.0/WAren6-Reader-Setup-v1.7.0.exe",
+      "sha256": "f9cd13ee4fdde4e50f4705f21cbee3003af2d97b823a2366e58abef6689a926e",
+      "size": 4185619
+    },
+    "reader_msi": {
+      "name": "WAren6-Reader-v1.7.0-x64.msi",
+      "url": "https://github.com/MayukXT/WAren6/releases/download/reader-v1.7.0/WAren6-Reader-v1.7.0-x64.msi",
+      "sha256": "b8e2266c594f4154462a06a7778e1bb81bf9173950173a03b680111a610a26c0",
+      "size": 6025216
+    },
+    "reader_portable": {
+      "name": "WAren6-Reader-Portable-v1.7.0.exe",
+      "url": "https://github.com/MayukXT/WAren6/releases/download/reader-v1.7.0/WAren6-Reader-Portable-v1.7.0.exe",
+      "sha256": "4aeb9260be0c945fc6f82336a43bef286650dccd21fbd4220a503a781f518be2",
+      "size": 16239616
+    }
+  }
+}
