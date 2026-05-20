@@ -1,6 +1,12 @@
-# WAren6
+<h1><img src="assets/waren6-logo.svg" alt="WAren6 logo" width="64" height="64" align="middle"> WAren6</h1>
 
 WAren6 [**W**hats**A**pp+Fo**ren**sics(**6**)] is a Windows toolkit for WhatsApp Desktop forensic extraction and review. It copies WhatsApp Desktop AppData folders to the directory you ran the script, decrypts WhatsApp SQLite databases and WAL files, reads WebView2 IndexedDB, and builds `unified_whatsapp.db`, which can be opened and analyzed by my WAren6 Reader (WhatsApp-like GUI) or DB Browser.
+
+## Product Walkthrough
+
+<video src="assets/waren6-showcase.mp4" controls autoplay muted loop playsinline></video>
+
+This walkthrough shows the WAren6 extraction flow, generated case output, `unified_whatsapp.db`, and WAren6 Reader review experience using a staged demonstration database with synthetic WhatsApp data. No personal chat data is included.
 
 ## NOTE!!!
 
