@@ -6,7 +6,7 @@ WAren6 [**W**hats**A**pp+Fo**ren**sics(**6**)] is a Windows toolkit for WhatsApp
 
 [![WAren6 product walkthrough](assets/waren6-showcase.gif)](assets/waren6-showcase.gif)
 
-This walkthrough shows the WAren6 extraction flow, generated case output, `unified_whatsapp.db`, and WAren6 Reader review experience using a staged demonstration database with synthetic WhatsApp data. No personal chat data is included.
+This walkthrough shows the WAren6 extraction flow, generated case output, `unified_whatsapp.db`, and WAren6 Reader review experience using a staged demonstration database with synthetic WhatsApp data. Please note the GUI can look shit over here, as it's in gif format (which only supports 256 color combinations).
 
 ## NOTE!!!
 
