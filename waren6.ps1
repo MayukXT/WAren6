@@ -433,11 +433,11 @@ function Protect-WAren6ManifestObject {
         return [PSCustomObject]$copy
     }
     if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
-        $items = @()
+        $items = [System.Collections.Generic.List[object]]::new()
         foreach ($item in $Value) {
-            $items += Protect-WAren6ManifestObject -Value $item -CaseRoot $CaseRoot
+            $items.Add((Protect-WAren6ManifestObject -Value $item -CaseRoot $CaseRoot)) | Out-Null
         }
-        return $items
+        return $items.ToArray()
     }
 
     $copy = [ordered]@{}
@@ -594,6 +594,17 @@ function Write-WAren6Output {
         }
         Write-WAren6Log $text
     }
+}
+
+function Write-WAren6StepTiming {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Stopwatch]$Stopwatch
+    )
+
+    $Stopwatch.Stop()
+    Write-WAren6Output ("  [time] {0}: {1}s" -f $Label, $Stopwatch.Elapsed.TotalSeconds.ToString("F1"))
+    $Stopwatch.Restart()
 }
 
 function Get-WAren6ModeLabel {
@@ -887,6 +898,7 @@ function Copy-Directory {
             "/R:3",
             "/W:1",
             "/B",
+            "/MT:8",
             "/NP",
             "/NFL",
             "/NDL",
@@ -939,16 +951,90 @@ function Copy-Directory {
             Write-Verbose "Robocopy completed successfully (exit code: $robocopyExitCode)."
         }
 
-        $copiedFiles = Get-ChildItem -Path $Destination -Recurse -Force -File
-        if ($copiedFiles.Count -eq 0) {
+        $hasCopiedFile = Get-ChildItem -Path $Destination -Recurse -Force -File -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $hasCopiedFile) {
             throw "Copy-Directory failed: No files were copied to '$Destination'."
         }
-        Write-Verbose "Copy completed. $($copiedFiles.Count) files copied."
+        Write-Verbose "Copy completed."
 
     }
     catch {
         throw "Error during copy operation: $($_.Exception.Message)"
     }
+}
+
+function Test-WAren6FileReadableNoExclusiveLock {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $true
+    }
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        return $true
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Wait-WAren6DatabaseLockRelease {
+    param(
+        [Parameter(Mandatory = $true)][string]$RootPath,
+        [Parameter(Mandatory = $false)][int]$TimeoutSeconds = 5
+    )
+
+    $probeFiles = [System.Collections.Generic.List[string]]::new()
+    foreach ($relative in @("session.db", "session.db-wal")) {
+        $candidate = Join-Path $RootPath $relative
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $probeFiles.Add($candidate) | Out-Null
+        }
+    }
+
+    $sessionsRoot = Join-Path $RootPath "sessions"
+    if (Test-Path -LiteralPath $sessionsRoot -PathType Container) {
+        Get-ChildItem -LiteralPath $sessionsRoot -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                foreach ($name in @("nativeSettings.db", "contacts.db", "genericStorage.db")) {
+                    $candidate = Join-Path $_.FullName $name
+                    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                        $probeFiles.Add($candidate) | Out-Null
+                    }
+                    $walCandidate = "$candidate-wal"
+                    if (Test-Path -LiteralPath $walCandidate -PathType Leaf) {
+                        $probeFiles.Add($walCandidate) | Out-Null
+                    }
+                }
+            }
+    }
+
+    if ($probeFiles.Count -eq 0) {
+        return $true
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $locked = @($probeFiles | Where-Object { -not (Test-WAren6FileReadableNoExclusiveLock -Path $_) })
+        if ($locked.Count -eq 0) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+
+    Write-Warning "Proceeding after lock wait timeout; backup-mode copy will still attempt preserved acquisition."
+    return $false
 }
 
 
@@ -979,6 +1065,28 @@ function Get-WAren6BytesSha256Hex {
         return [BitConverter]::ToString($sha.ComputeHash($Bytes)).Replace('-', '').ToLowerInvariant()
     }
     finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-WAren6FileSha256Hex {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $stream = $null
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        if ($stream) { $stream.Dispose() }
         $sha.Dispose()
     }
 }
@@ -1434,7 +1542,9 @@ function Compress-Directory {
 function Get-SHA256Checksum {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$FilePath
+        [string]$FilePath,
+        [Parameter(Mandatory = $false)]
+        [string]$Sha256Hash
     )
 
     try {
@@ -1442,14 +1552,19 @@ function Get-SHA256Checksum {
             throw "File '$FilePath' not found."
         }
 
-        $hash = Get-FileHash -Path $FilePath -Algorithm SHA256
+        $hashValue = if ([string]::IsNullOrWhiteSpace($Sha256Hash)) {
+            Get-WAren6FileSha256Hex -Path $FilePath
+        }
+        else {
+            $Sha256Hash
+        }
         if ($FilePath -like "*.zip") {
             $outputFilePath = $FilePath -replace "\.zip$", ".sha256.txt"
         }
         else {
             $outputFilePath = $FilePath + ".sha256.txt"
         }
-        "$($hash.Hash)  $(Split-Path -Path $FilePath -Leaf)" | Out-File -FilePath $outputFilePath -Encoding UTF8
+        "$hashValue  $(Split-Path -Path $FilePath -Leaf)" | Out-File -FilePath $outputFilePath -Encoding UTF8
         return $outputFilePath
     }
     catch {
@@ -1569,7 +1684,7 @@ function New-WAren6CaseArchive {
         Path = $archivePath
         Format = $format
         Size = (Get-Item -LiteralPath $archivePath).Length
-        Sha256 = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+        Sha256 = Get-WAren6FileSha256Hex -Path $archivePath
     }
 }
 
@@ -1657,7 +1772,7 @@ function Protect-WAren6FileAesCbcHmac {
         iv_b64 = [Convert]::ToBase64String($iv)
         plaintext_name = $inputItem.Name
         plaintext_size = $inputItem.Length
-        plaintext_sha256 = (Get-FileHash -LiteralPath $InputPath -Algorithm SHA256).Hash
+        plaintext_sha256 = Get-WAren6FileSha256Hex -Path $InputPath
     }
     $headerJson = ($header | ConvertTo-Json -Depth 6 -Compress)
     $headerBytes = [System.Text.Encoding]::UTF8.GetBytes($headerJson)
@@ -1723,7 +1838,7 @@ function Protect-WAren6FileAesCbcHmac {
     return [PSCustomObject]@{
         Path = $OutputPath
         Size = (Get-Item -LiteralPath $OutputPath).Length
-        Sha256 = (Get-FileHash -LiteralPath $OutputPath -Algorithm SHA256).Hash
+        Sha256 = Get-WAren6FileSha256Hex -Path $OutputPath
         PlaintextSha256 = $header.plaintext_sha256
     }
 }
@@ -1767,7 +1882,7 @@ function Split-WAren6TransferFile {
                 path = $partItem.FullName
                 name = $partItem.Name
                 size = $partItem.Length
-                sha256 = (Get-FileHash -LiteralPath $partItem.FullName -Algorithm SHA256).Hash
+                sha256 = Get-WAren6FileSha256Hex -Path $partItem.FullName
             }
             $index++
         }
@@ -2168,13 +2283,13 @@ function Write-WAren6TransferManifest {
             name = $archiveItem.Name
             path = $archiveItem.FullName
             size = $archiveItem.Length
-            sha256 = (Get-FileHash -LiteralPath $archiveItem.FullName -Algorithm SHA256).Hash
+            sha256 = Get-WAren6FileSha256Hex -Path $archiveItem.FullName
         }
         transfer_file = [ordered]@{
             name = $payloadItem.Name
             path = $payloadItem.FullName
             size = $payloadItem.Length
-            sha256 = (Get-FileHash -LiteralPath $payloadItem.FullName -Algorithm SHA256).Hash
+            sha256 = Get-WAren6FileSha256Hex -Path $payloadItem.FullName
         }
         parts = @($Parts | Sort-Object index | ForEach-Object {
             [ordered]@{
@@ -2295,7 +2410,7 @@ function Invoke-WAren6TelegramTransfer {
                 path = $payloadItem.FullName
                 name = $payloadItem.Name
                 size = $payloadItem.Length
-                sha256 = (Get-FileHash -LiteralPath $payloadItem.FullName -Algorithm SHA256).Hash
+                sha256 = Get-WAren6FileSha256Hex -Path $payloadItem.FullName
             })
         }
 
@@ -2369,22 +2484,37 @@ function Invoke-WAren6VerifiedAutoDelete {
 function Get-WAren6FileInventory {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RootPath
+        [string]$RootPath,
+        [Parameter(Mandatory = $false)]
+        [string[]]$ExcludeRelativePaths = @()
     )
 
     $root = (Resolve-Path -LiteralPath $RootPath).Path
-    $items = @()
-    Get-ChildItem -LiteralPath $root -Recurse -Force -File | ForEach-Object {
-        $relative = $_.FullName.Substring($root.Length).TrimStart('\')
-        $sha = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
-        $items += [PSCustomObject]@{
-            path = $relative
-            size = $_.Length
-            sha256 = $sha
-            lastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
+    $items = [System.Collections.Generic.List[object]]::new()
+    $excludeSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($relativePath in $ExcludeRelativePaths) {
+        if (-not [string]::IsNullOrWhiteSpace($relativePath)) {
+            $excludeSet.Add($relativePath.TrimStart('\', '/')) | Out-Null
         }
     }
-    return $items
+    $hashedCount = 0
+    Get-ChildItem -LiteralPath $root -Recurse -Force -File | ForEach-Object {
+        $relative = $_.FullName.Substring($root.Length).TrimStart('\')
+        if (-not $excludeSet.Contains($relative)) {
+            $sha = Get-WAren6FileSha256Hex -Path $_.FullName
+            $items.Add([PSCustomObject]@{
+                path = $relative
+                size = $_.Length
+                sha256 = $sha
+                lastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
+            }) | Out-Null
+            $hashedCount++
+            if (($hashedCount % 500) -eq 0) {
+                Write-WAren6Output "  [>] Manifest inventory: $hashedCount files hashed..."
+            }
+        }
+    }
+    return $items.ToArray()
 }
 
 function Write-WAren6Manifest {
@@ -2400,17 +2530,29 @@ function Write-WAren6Manifest {
         [Parameter(Mandatory = $false)]
         [string]$CommandLine,
         [Parameter(Mandatory = $false)]
-        [object]$ModeInfo
+        [object]$ModeInfo,
+        [Parameter(Mandatory = $false)]
+        [object[]]$PrecomputedFiles,
+        [Parameter(Mandatory = $false)]
+        [object]$ArchiveInfo
     )
 
     $caseRoot = (Resolve-Path -LiteralPath $CasePath).Path
     $archiveInfo = $null
-    if ($ArchivePath -and (Test-Path -LiteralPath $ArchivePath)) {
+    if ($ArchiveInfo) {
+        $archiveInfo = [PSCustomObject]@{
+            path = $ArchiveInfo.Path
+            format = $ArchiveInfo.Format
+            size = $ArchiveInfo.Size
+            sha256 = $ArchiveInfo.Sha256
+        }
+    }
+    elseif ($ArchivePath -and (Test-Path -LiteralPath $ArchivePath)) {
         $archiveItem = Get-Item -LiteralPath $ArchivePath
         $archiveInfo = [PSCustomObject]@{
             path = $archiveItem.FullName
             size = $archiveItem.Length
-            sha256 = (Get-FileHash -LiteralPath $archiveItem.FullName -Algorithm SHA256).Hash
+            sha256 = Get-WAren6FileSha256Hex -Path $archiveItem.FullName
         }
     }
 
@@ -2424,6 +2566,13 @@ function Write-WAren6Manifest {
         }
     }
 
+    $files = if ($PSBoundParameters.ContainsKey('PrecomputedFiles') -and $null -ne $PrecomputedFiles) {
+        $PrecomputedFiles
+    }
+    else {
+        Get-WAren6FileInventory -RootPath $caseRoot -ExcludeRelativePaths @("WAren6.manifest.json")
+    }
+
     $manifest = [PSCustomObject]@{
         schema = "waren6.manifest.v1"
         tool = "WAren6"
@@ -2432,7 +2581,7 @@ function Write-WAren6Manifest {
         timezone = [System.TimeZoneInfo]::Local.Id
         commandLine = Protect-WAren6PathText -Text $CommandLine -CaseRoot $caseRoot
         casePath = "<case-root>"
-        files = Get-WAren6FileInventory -RootPath $caseRoot
+        files = $files
         archive = Protect-WAren6ManifestObject -Value $archiveInfo -CaseRoot $caseRoot
         validation = Protect-WAren6ManifestObject -Value $validation -CaseRoot $caseRoot
         mode = Protect-WAren6ManifestObject -Value $ModeInfo -CaseRoot $caseRoot
@@ -2491,12 +2640,14 @@ function Write-WAren6UnifyLater {
         [Parameter(Mandatory = $true)]
         [string]$CasePath,
         [Parameter(Mandatory = $false)]
-        [string]$ArchivePath
+        [string]$ArchivePath,
+        [switch]$WithMedia
     )
 
     $scriptPath = Join-Path $PSScriptRoot "waren6.py"
-    $caseCommand = "python `"$scriptPath`" --unify `"$CasePath`" --with-media-index"
-    $archiveCommand = if ($ArchivePath) { "python `"$scriptPath`" --unify `"$ArchivePath`" --with-media-index" } else { $null }
+    $mediaFlag = if ($WithMedia) { " --with-media-index" } else { "" }
+    $caseCommand = "python `"$scriptPath`" --unify `"$CasePath`"$mediaFlag"
+    $archiveCommand = if ($ArchivePath) { "python `"$scriptPath`" --unify `"$ArchivePath`"$mediaFlag" } else { $null }
     $content = @(
         "WAren6 unify-later commands",
         "",
@@ -2776,7 +2927,9 @@ function Invoke-WAren6WhatsAppRuntimeLaunch {
 
     Start-Process "explorer.exe" "shell:AppsFolder\5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App" -WindowStyle Hidden | Out-Null
     if ($Silent) {
-        Hide-WAren6WhatsAppWindowsForPeriod -Seconds 8 -IntervalMilliseconds 150
+        Hide-WAren6WhatsAppWindows
+        Start-Sleep -Milliseconds 500
+        Hide-WAren6WhatsAppWindows
     }
     else {
         Start-Sleep -Seconds 2
@@ -2867,7 +3020,7 @@ function Get-WAren6RuntimeExpression {
     if (recovered) withText += 1;
     const msgType = s((msg && msg.type) || row.type);
     byType[msgType || "unknown"] = (byType[msgType || "unknown"] || 0) + 1;
-    messages.push({
+    const record = {
       schema: "waren6.live-runtime-store8-message.v1",
       source: "whatsapp_webview2_runtime",
       msg_key: msgKey,
@@ -2908,7 +3061,8 @@ function Get-WAren6RuntimeExpression {
       height: row.height ?? (msg && msg.height) ?? null,
       opaque_byte_length: olen(row.msgRowOpaqueData),
       serializer_recovered_text: Boolean(recovered)
-    });
+    };
+    messages.push(JSON.stringify(record));
   }
   return {
     schema: "waren6.live-runtime-store8-capture.v1",
@@ -2921,7 +3075,7 @@ function Get-WAren6RuntimeExpression {
     rows_without_text: messages.length - withText,
     serializer_errors: serializerErrors,
     by_type: byType,
-    messages
+    messages_jsonl: messages.join("\n")
   };
 })()
 '@
@@ -3062,12 +3216,16 @@ function Invoke-WAren6RuntimeStore8Capture {
                     continue
                 }
                 $payload = $result.result.value
-                if ($payload -and $payload.messages -and $payload.messages.Count -gt 0) {
+                $hasJsonlPayload = $payload -and $payload.messages_jsonl -and ([string]$payload.messages_jsonl).Length -gt 0
+                $hasLegacyMessages = $payload -and $payload.messages -and $payload.messages.Count -gt 0
+                if ($hasJsonlPayload -or $hasLegacyMessages) {
                     break
                 }
                 Start-Sleep -Seconds 3
             }
-            if (-not $payload -or -not $payload.messages) {
+            $hasJsonlPayload = $payload -and $payload.messages_jsonl -and ([string]$payload.messages_jsonl).Length -gt 0
+            $hasLegacyMessages = $payload -and $payload.messages -and $payload.messages.Count -gt 0
+            if (-not $hasJsonlPayload -and -not $hasLegacyMessages) {
                 if ($lastRuntimeException) {
                     throw "Runtime JS evaluation failed: $lastRuntimeException"
                 }
@@ -3076,8 +3234,21 @@ function Invoke-WAren6RuntimeStore8Capture {
 
             $writer = [System.IO.StreamWriter]::new($jsonlPath, $false, [System.Text.UTF8Encoding]::new($false))
             try {
-                foreach ($message in $payload.messages) {
-                    $writer.WriteLine(($message | ConvertTo-Json -Depth 20 -Compress))
+                if ($payload.messages_jsonl) {
+                    $writer.Write($payload.messages_jsonl)
+                    if (-not ([string]$payload.messages_jsonl).EndsWith("`n")) {
+                        $writer.WriteLine()
+                    }
+                }
+                else {
+                    foreach ($message in $payload.messages) {
+                        if ($message -is [string]) {
+                            $writer.WriteLine($message)
+                        }
+                        else {
+                            $writer.WriteLine(($message | ConvertTo-Json -Depth 20 -Compress))
+                        }
+                    }
                 }
             }
             finally {
@@ -3094,7 +3265,7 @@ function Invoke-WAren6RuntimeStore8Capture {
                 rowsWithoutText = $payload.rows_without_text
                 serializerErrors = $payload.serializer_errors
                 outputJsonl = "<case-root>\runtime\runtime_store8_messages.jsonl"
-                outputJsonlSha256 = (Get-FileHash -LiteralPath $jsonlPath -Algorithm SHA256).Hash
+                outputJsonlSha256 = Get-WAren6FileSha256Hex -Path $jsonlPath
             }
             $summary | ConvertTo-Json -Depth 8 | Out-File -LiteralPath $summaryPath -Encoding UTF8
             return $jsonlPath
@@ -3161,7 +3332,7 @@ function Copy-WAren6RuntimeSupplement {
             $summary = Get-Content -Raw -LiteralPath $sourceSummary | ConvertFrom-Json
             $summary.targetUrl = "https://web.whatsapp.com/"
             $summary.outputJsonl = "<case-root>\runtime\runtime_store8_messages.jsonl"
-            $summary.outputJsonlSha256 = (Get-FileHash -LiteralPath $destJsonl -Algorithm SHA256).Hash
+            $summary.outputJsonlSha256 = Get-WAren6FileSha256Hex -Path $destJsonl
             $summary | ConvertTo-Json -Depth 8 | Out-File -LiteralPath $destSummary -Encoding UTF8
         }
         catch {
@@ -3583,6 +3754,7 @@ public class ClipcWrapper {
     Write-Verbose $verboseSourcePath
     Write-Verbose "Copying $verboseSourcePath to $verboseOutputPath"
 
+    $acquisitionStepWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $runtimeCaptureRoot = $null
     $runtimeCapturedJsonl = $null
     if ($Hybrid -and -not $RuntimeStore8Jsonl) {
@@ -3596,7 +3768,7 @@ public class ClipcWrapper {
             $modeInfo.runtimeSupplement = [PSCustomObject]@{
                 path = $null
                 stagedPath = $runtimeCapturedJsonl
-                sha256 = if (Test-WAren6RuntimeJsonl -Path $runtimeCapturedJsonl) { (Get-FileHash -LiteralPath $runtimeCapturedJsonl -Algorithm SHA256).Hash } else { $null }
+                sha256 = if (Test-WAren6RuntimeJsonl -Path $runtimeCapturedJsonl) { Get-WAren6FileSha256Hex -Path $runtimeCapturedJsonl } else { $null }
                 status = if (Test-WAren6RuntimeJsonl -Path $runtimeCapturedJsonl) { "staged" } else { "captured_unusable" }
                 usableRecords = $null
                 recordsWithText = $null
@@ -3623,6 +3795,7 @@ public class ClipcWrapper {
             }
             Write-Warning "Hybrid runtime capture failed: $($_.Exception.Message). Continuing with offline extraction."
         }
+        Write-WAren6StepTiming -Label "Runtime capture" -Stopwatch $acquisitionStepWatch
     }
     
     # Close WhatsApp to release file locks on databases
@@ -3645,17 +3818,18 @@ public class ClipcWrapper {
         if ($remaining) {
             Write-Warning "Force-terminating WhatsApp..."
             $remaining | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
         }
-        Start-Sleep -Seconds 2
+        Wait-WAren6DatabaseLockRelease -RootPath $WhatsAppPath | Out-Null
         Write-WAren6Output "  [OK] File locks released. Proceeding with copy..."
     }
+    Write-WAren6StepTiming -Label "WhatsApp shutdown" -Stopwatch $acquisitionStepWatch
     
     $localStateExcludes = @()
     if (-not $WithMedia) {
         $localStateExcludes += "transfers"
     }
     Copy-Directory -Source $WhatsAppPath -Destination $targetOutput -ExcludeDirectories $localStateExcludes
+    Write-WAren6StepTiming -Label "LocalState copy" -Stopwatch $acquisitionStepWatch
     if ($runtimeCapturedJsonl) {
         $preservedRuntimeJsonl = Copy-WAren6RuntimeSupplement `
             -SourceJsonl $runtimeCapturedJsonl `
@@ -3664,7 +3838,7 @@ public class ClipcWrapper {
             $RuntimeStore8Jsonl = $preservedRuntimeJsonl
             if ($modeInfo.runtimeSupplement) {
                 $modeInfo.runtimeSupplement.path = $RuntimeStore8Jsonl
-                $modeInfo.runtimeSupplement.sha256 = (Get-FileHash -LiteralPath $RuntimeStore8Jsonl -Algorithm SHA256).Hash
+                $modeInfo.runtimeSupplement.sha256 = Get-WAren6FileSha256Hex -Path $RuntimeStore8Jsonl
                 $modeInfo.runtimeSupplement.status = "preserved"
             }
             Write-WAren6Output "  [>] Runtime Store 8 supplement preserved in case folder."
@@ -3678,6 +3852,7 @@ public class ClipcWrapper {
             }
             Write-Warning "Runtime Store 8 supplement was not preserved because the staged JSONL was missing or empty."
         }
+        Write-WAren6StepTiming -Label "Runtime supplement preservation" -Stopwatch $acquisitionStepWatch
     }
     "WAren6 DATE: $reverseDate" | Out-File -FilePath "$targetOutput\$metaDataFileName" -Append
 
@@ -3690,6 +3865,7 @@ public class ClipcWrapper {
         Write-WAren6Output "  [>] Acquiring WebView2 IndexedDB"
         Copy-Directory -Source $idbSource -Destination $idbDestIndexedDB
         Write-WAren6Output "  [OK] IndexedDB acquired successfully"
+        Write-WAren6StepTiming -Label "IndexedDB copy" -Stopwatch $acquisitionStepWatch
     }
     else {
         Write-Warning "WebView2 IndexedDB not found at '$idbSource' - unified DB will not be built."
@@ -3707,6 +3883,7 @@ public class ClipcWrapper {
         Write-WAren6Output "  [>] Acquiring WebView2 Local Storage"
         Copy-Directory -Source $localStorageSource -Destination $localStorageDest
         Write-WAren6Output "  [OK] Local Storage acquired successfully"
+        Write-WAren6StepTiming -Label "Local Storage copy" -Stopwatch $acquisitionStepWatch
     }
     else {
         Write-Warning "WebView2 Local Storage not found at '$localStorageSource' - encrypted opaque message rows may remain unresolved."
@@ -3753,6 +3930,7 @@ public class ClipcWrapper {
         $oduidFingerprint = Format-WAren6SecretFingerprint -Bytes $WhatsAppAppUID
         "ODUID_SHA256: $(Get-WAren6BytesSha256Hex -Bytes $WhatsAppAppUID)" | Out-File -FilePath "$targetOutput\$metaDataFileName" -Append
         Write-WAren6Output "ODUID: [redacted; sha256:$oduidFingerprint]"
+        Write-WAren6StepTiming -Label "ODUID" -Stopwatch $acquisitionStepWatch
     }
     else {
         $WhatsAppAppUID = Convert-HexStringToByteArray $ID
@@ -3763,6 +3941,7 @@ public class ClipcWrapper {
         }
         "ODUID_SHA256: $(Get-WAren6BytesSha256Hex -Bytes $WhatsAppAppUID)" | Out-File -FilePath "$targetOutput\$metaDataFileName" -Append
         Write-WAren6Output "  [>] Supplied ODUID processing: [redacted; sha256:$(Format-WAren6SecretFingerprint -Bytes $WhatsAppAppUID)]"
+        Write-WAren6StepTiming -Label "ODUID" -Stopwatch $acquisitionStepWatch
     }
     
     $sectionWatch.Stop()
@@ -4158,7 +4337,7 @@ public class ClipcWrapper {
         if (-not $pythonExe) {
             Write-Warning "All Python resolution strategies failed. Unified database will not be built."
             Write-Warning "Unification can be completed later with: python waren6.py --unify `"$targetOutput`""
-            Write-WAren6UnifyLater -CasePath $targetOutput | Out-Null
+            Write-WAren6UnifyLater -CasePath $targetOutput -WithMedia:$WithMedia | Out-Null
         }
         else {
             # -- Ensure ccl_chromium_reader dependency is installed -------------
@@ -4203,6 +4382,7 @@ public class ClipcWrapper {
             $store8DecryptionReport = if ($store8DebugReports) { Join-Path $targetOutput "store8_decryption_report.json" } else { $null }
             $store8SaltHuntReport = if ($store8DebugReports) { Join-Path $targetOutput "store8_salt_hunt_report.json" } else { $null }
             $pythonArgs = @(
+                "-u",
                 $waExtractScript,
                 "--idb-path", $idbDest,
                 "--decrypted-dir", $targetOutput,
@@ -4252,11 +4432,11 @@ public class ClipcWrapper {
                 $pythonArgs += "--with-media-index"
                 $pythonArgs += @("--media-index-report", (Join-Path $targetOutput "media_index_report.json"))
             }
-            $pythonOutput = & $pythonExe @pythonArgs 2>&1
-            $pythonExitCode = $LASTEXITCODE
-            foreach ($line in $pythonOutput) {
+            & $pythonExe @pythonArgs 2>&1 | ForEach-Object {
+                $line = $_
                 Write-WAren6Output (Protect-WAren6PathText -Text ([string]$line) -CaseRoot $targetOutput)
             }
+            $pythonExitCode = $LASTEXITCODE
 
             Write-WAren6Output "  ------------------------------------------------------------"
             if ($pythonExitCode -eq 0 -and (Test-Path $unifiedDb)) {
@@ -4326,6 +4506,7 @@ public class ClipcWrapper {
     $checksumFileArchive = $null
     $manifestPath = $null
     $rootManifestPath = Join-Path $OutputDirectory "$archiveBaseName.manifest.json"
+    $caseFileInventory = $null
     $telegramResult = $null
     $caseDirectoryRemoved = $false
     $unifiedDbWasBuilt = $false
@@ -4333,12 +4514,14 @@ public class ClipcWrapper {
     if (Test-Path -LiteralPath $targetOutput) {
         Sync-WAren6CaseLog -CasePath $targetOutput | Out-Null
         Write-WAren6Output "  [>] Writing pre-archive forensic manifest..."
+        $caseFileInventory = Get-WAren6FileInventory -RootPath $targetOutput -ExcludeRelativePaths @("WAren6.manifest.json")
         Write-WAren6Manifest `
             -CasePath $targetOutput `
             -OutputDirectory $OutputDirectory `
             -ValidationReportPath $validationReportPath `
             -CommandLine (Protect-WAren6CommandLine -CommandLine ([Environment]::CommandLine)) `
-            -ModeInfo $modeInfo | Out-Null
+            -ModeInfo $modeInfo `
+            -PrecomputedFiles $caseFileInventory | Out-Null
     }
 
     Write-WAren6Output "  [>] Compressing extraction directory..."
@@ -4355,7 +4538,7 @@ public class ClipcWrapper {
 
     # Generate integrity HASH
     Write-WAren6Output "  [>] Calculating SHA-256 Checksum..."
-    $checksumFileArchive = Get-SHA256Checksum -FilePath $archivePath
+    $checksumFileArchive = Get-SHA256Checksum -FilePath $archivePath -Sha256Hash $archiveInfo.Sha256
     if ($checksumFileArchive) {
         Write-Verbose "Checksum file (archive): $checksumFileArchive"
     }
@@ -4368,9 +4551,11 @@ public class ClipcWrapper {
             -CasePath $targetOutput `
             -OutputDirectory $OutputDirectory `
             -ArchivePath $archivePath `
+            -ArchiveInfo $archiveInfo `
             -ValidationReportPath $validationReportPath `
             -CommandLine (Protect-WAren6CommandLine -CommandLine ([Environment]::CommandLine)) `
-            -ModeInfo $modeInfo
+            -ModeInfo $modeInfo `
+            -PrecomputedFiles $caseFileInventory
         Write-WAren6Output "  [OK] Manifest: $manifestPath"
         Sync-WAren6CaseLog -CasePath $targetOutput | Out-Null
     }

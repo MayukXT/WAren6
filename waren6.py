@@ -20,6 +20,7 @@ import base64
 import binascii
 import csv
 import datetime
+import functools
 import hashlib
 import hmac
 import html
@@ -111,6 +112,7 @@ CREATE TABLE IF NOT EXISTS contacts (
     PRIMARY KEY (lid)
 );
 CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts(phone_number);
+CREATE INDEX IF NOT EXISTS idx_contacts_phone_jid ON contacts(phone_jid);
 
 -- Chat/conversation directory
 CREATE TABLE IF NOT EXISTS chats (
@@ -186,6 +188,9 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (chat_jid) REFERENCES chats(chat_jid)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_jid);
+CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_msg_key ON messages(msg_key);
+CREATE INDEX IF NOT EXISTS idx_messages_msgid_ts ON messages(msg_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_msgid_ts ON messages(chat_jid, msg_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_jid);
@@ -235,6 +240,7 @@ CREATE TABLE IF NOT EXISTS reactions (
     timestamp           INTEGER,
     FOREIGN KEY (parent_msg_key) REFERENCES messages(msg_key)
 );
+CREATE INDEX IF NOT EXISTS idx_reactions_parent_sender_ts ON reactions(parent_msg_key, sender_jid, sender_phone, sender_name, timestamp);
 
 -- Mention metadata preserved from Store 8/runtime rows when WhatsApp exposes
 -- it. The Reader uses this instead of guessing raw @ text whenever possible.
@@ -288,6 +294,7 @@ CREATE TABLE IF NOT EXISTS group_participants (
     is_super_admin  INTEGER DEFAULT 0,
     FOREIGN KEY (group_jid) REFERENCES groups(group_jid)
 );
+CREATE INDEX IF NOT EXISTS idx_group_participants_group ON group_participants(group_jid);
 
 -- Summary view (auto-generated convenience)
 CREATE VIEW IF NOT EXISTS chat_summary AS
@@ -306,6 +313,49 @@ LEFT JOIN messages m ON c.chat_jid = m.chat_jid
 GROUP BY c.chat_jid
 ORDER BY last_message DESC;
 """
+
+
+def split_unified_schema(schema):
+    """Return (tables_and_views, indexes) so bulk loads can defer index work."""
+    table_statements = []
+    index_statements = []
+    statement_lines = []
+    index_re = re.compile(r"^\s*(?:--[^\n]*\n\s*)*CREATE\s+INDEX\b", re.IGNORECASE)
+
+    for line in schema.splitlines():
+        statement_lines.append(line)
+        statement = "\n".join(statement_lines).strip()
+        if not statement or not sqlite3.complete_statement(statement):
+            continue
+        if index_re.match(statement):
+            index_statements.append(statement)
+        else:
+            table_statements.append(statement)
+        statement_lines = []
+
+    trailing = "\n".join(statement_lines).strip()
+    if trailing:
+        table_statements.append(trailing)
+
+    return "\n".join(table_statements) + "\n", "\n".join(index_statements) + "\n"
+
+
+UNIFIED_TABLE_SCHEMA, UNIFIED_INDEX_SCHEMA = split_unified_schema(UNIFIED_SCHEMA)
+
+
+def create_unified_indexes(conn):
+    """Create query indexes after bulk inserts to avoid per-row index churn."""
+    conn.executescript(UNIFIED_INDEX_SCHEMA)
+
+
+def configure_unified_output_connection(conn):
+    """Tune the generated unified DB connection for large one-pass builds."""
+    conn.execute("PRAGMA journal_mode=MEMORY")
+    conn.execute("PRAGMA synchronous=OFF")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-131072")
+    conn.execute("PRAGMA mmap_size=268435456")
+    conn.execute("PRAGMA locking_mode=EXCLUSIVE")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -327,9 +377,9 @@ def find_first_jid_suffix(value: str):
     return best if best else (None, None)
 
 
-def normalize_chat_id(chat_id: str):
-    """Normalize genericStorage composite chat ids to (chat_jid, stanza, sender)."""
-    chat_id = safe_str(chat_id)
+@functools.lru_cache(maxsize=16384)
+def _normalize_chat_id_cached(chat_id: str):
+    """Normalize string chat ids after callers coerce raw values safely."""
     if not chat_id:
         return None, None, None
 
@@ -351,6 +401,11 @@ def normalize_chat_id(chat_id: str):
                 sender_jid = remainder[underscore + 1:] or None
 
     return chat_jid, stanza_id, sender_jid
+
+
+def normalize_chat_id(chat_id: str):
+    """Normalize genericStorage composite chat ids to (chat_jid, stanza, sender)."""
+    return _normalize_chat_id_cached(safe_str(chat_id) or "")
 
 
 def parse_msg_key(msg_key: str):
@@ -1088,12 +1143,17 @@ def hunt_store8_network_salts(
 
 
 def execute_many_counting(cursor, sql, rows, collision_kind=None):
-    rows = list(rows)
+    if isinstance(rows, (list, tuple)):
+        row_count = len(rows)
+        db_rows = rows
+    else:
+        db_rows = list(rows)
+        row_count = len(db_rows)
     before = cursor.connection.total_changes
-    cursor.executemany(sql, rows)
+    cursor.executemany(sql, db_rows)
     inserted = cursor.connection.total_changes - before
     if collision_kind:
-        record_collision(collision_kind, len(rows), inserted)
+        record_collision(collision_kind, row_count, inserted)
     return inserted
 
 
@@ -2424,6 +2484,7 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
         os.rename(output_path, backup)
 
     conn = sqlite3.connect(output_path)
+    configure_unified_output_connection(conn)
     cursor = conn.cursor()
     runtime_store8_supplement = runtime_store8_supplement or {}
     runtime_store8_records = runtime_store8_supplement.get("records_by_msg_key", {})
@@ -2431,9 +2492,17 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
     mention_batch = []
     edit_markers = {}
     edit_events = {}
+    _resolve_cache = {}
 
-    # Create schema
-    cursor.executescript(UNIFIED_SCHEMA)
+    def cached_resolve_jid(jid):
+        if not jid:
+            return None, None
+        if jid not in _resolve_cache:
+            _resolve_cache[jid] = resolve_jid(jid, lid_to_phone, lid_to_name)
+        return _resolve_cache[jid]
+
+    # Create tables/views first; indexes are deferred until after bulk inserts.
+    cursor.executescript(UNIFIED_TABLE_SCHEMA)
 
     message_insert_columns = (
         "msg_key", "msg_id", "chat_jid", "chat_name", "chat_phone",
@@ -2466,7 +2535,7 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
                     display_text or "@all", source, "high",
                 ))
                 continue
-            target_phone, target_name = resolve_jid(target_jid, lid_to_phone, lid_to_name)
+            target_phone, target_name = cached_resolve_jid(target_jid)
             mention_batch.append((
                 msg_key, chat_jid, idx, kind, target_jid or None,
                 target_phone, target_name, display_text, source,
@@ -2490,7 +2559,7 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
             return
         _, _, _, event_sender = parse_msg_key(msg_key)
         editor_jid = sender_jid or event_sender
-        editor_phone, editor_name = resolve_jid(editor_jid, lid_to_phone, lid_to_name) if editor_jid else (None, None)
+        editor_phone, editor_name = cached_resolve_jid(editor_jid) if editor_jid else (None, None)
         key = (
             event.get("target_msg_key"),
             event.get("edit_event_msg_key") or event.get("provenance_sha256"),
@@ -2593,7 +2662,7 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
         # Resolve chat phone + name for 1:1 chats
         chat_phone_val = None
         if not is_group and not is_nl:
-            chat_phone_val, resolved_name = resolve_jid(chat_jid, lid_to_phone, lid_to_name)
+            chat_phone_val, resolved_name = cached_resolve_jid(chat_jid)
             if not name and resolved_name:
                 name = resolved_name
 
@@ -2619,7 +2688,7 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
             continue
 
         owner_lid = safe_str(grp.get('owner'))
-        owner_phone, _ = resolve_jid(owner_lid, lid_to_phone, lid_to_name)
+        owner_phone, _ = cached_resolve_jid(owner_lid)
 
         cursor.execute("""
             INSERT OR REPLACE INTO groups
@@ -2668,7 +2737,7 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
 
         for p in participants:
             p_str = str(p)
-            p_phone, p_name = resolve_jid(p_str, lid_to_phone, lid_to_name)
+            p_phone, p_name = cached_resolve_jid(p_str)
 
             cursor.execute("""
                 INSERT OR IGNORE INTO group_participants
@@ -2720,6 +2789,14 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
 
     def pick_generic_text(chat_jid, ts, idb_body, msg_type, media_filename):
         """Return the best unconsumed genericStorage text near an IDB row."""
+        if idb_body:
+            for entry in generic_entries_by_chat_ts.get((chat_jid, ts), []):
+                if entry['index'] in used_generic_indexes:
+                    continue
+                raw_candidate = entry.get('text') or ''
+                if raw_candidate == idb_body:
+                    return (entry, raw_candidate, raw_candidate, 0)
+
         best = None
         best_score = None
         for delta in [0, -1, 1, -2, 2]:
@@ -2799,7 +2876,7 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
         chat_name = chat_names.get(chat_jid)
 
         # Resolve chat phone for 1:1 chats
-        chat_phone, resolved_name = resolve_jid(chat_jid, lid_to_phone, lid_to_name)
+        chat_phone, resolved_name = cached_resolve_jid(chat_jid)
         if not chat_name and resolved_name:
             chat_name = resolved_name
 
@@ -2807,7 +2884,7 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
         sender_phone = None
         sender_name = None
         if sender_jid:
-            sender_phone, sender_name = resolve_jid(sender_jid, lid_to_phone, lid_to_name)
+            sender_phone, sender_name = cached_resolve_jid(sender_jid)
 
         # ── Reply / Quote context ────────────────────────────────────────
         quoted_stanza_id, quoted_participant, quoted_msg_body, quoted_msg_type = extract_quote_context(msg_rec)
@@ -3003,14 +3080,14 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
         is_group = 1 if '@g.us' in str(chat_jid) else 0
         chat_name = chat_names.get(chat_jid)
 
-        chat_phone, resolved_name = resolve_jid(chat_jid, lid_to_phone, lid_to_name)
+        chat_phone, resolved_name = cached_resolve_jid(chat_jid)
         if not chat_name and resolved_name:
             chat_name = resolved_name
 
         sender_phone = None
         sender_name = None
         if sender_jid:
-            sender_phone, sender_name = resolve_jid(sender_jid, lid_to_phone, lid_to_name)
+            sender_phone, sender_name = cached_resolve_jid(sender_jid)
 
         media_mime_type = safe_str(runtime_rec.get('mimetype'))
         media_filename = safe_str(runtime_rec.get('filename'))
@@ -3111,13 +3188,13 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
 
             is_group = 1 if '@g.us' in str(chat_jid) else 0
             chat_name = chat_names.get(chat_jid)
-            chat_phone, resolved_name = resolve_jid(chat_jid, lid_to_phone, lid_to_name)
+            chat_phone, resolved_name = cached_resolve_jid(chat_jid)
             if not chat_name and resolved_name:
                 chat_name = resolved_name
             sender_phone = None
             sender_name = None
             if sender_jid:
-                sender_phone, sender_name = resolve_jid(sender_jid, lid_to_phone, lid_to_name)
+                sender_phone, sender_name = cached_resolve_jid(sender_jid)
 
             body_status = classify_body_status(
                 text=text,
@@ -3141,6 +3218,10 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
     if fts_only_batch:
         log_detail(f"  Inserting {len(fts_only_batch)} FTS-only messages (no IndexedDB match)...")
         execute_many_counting(cursor, message_insert_sql, fts_only_batch, "generic_storage_message_insert")
+    conn.commit()
+
+    print("  [>] Creating unified query indexes...")
+    create_unified_indexes(conn)
     conn.commit()
 
     # ── Fallback enrichment for FTS-only messages ─────────────────────────
@@ -3173,6 +3254,7 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
 
     # Pass: exact + fuzzy ±2s timestamp match on FTS-only messages
     fallback_enriched = 0
+    fallback_updates = []
     cursor.execute("""
         SELECT rowid, chat_jid, timestamp FROM messages
         WHERE from_me IS NULL AND timestamp IS NOT NULL
@@ -3188,18 +3270,20 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
             mk, fm, sender = matched
             s_phone, s_name = (None, None)
             if sender:
-                s_phone, s_name = resolve_jid(sender, lid_to_phone, lid_to_name)
-            cursor.execute("""
-                UPDATE messages SET
-                    msg_key = COALESCE(msg_key, ?),
-                    from_me = ?,
-                    sender_jid = COALESCE(sender_jid, ?),
-                    sender_phone = COALESCE(sender_phone, ?),
-                    sender_name = COALESCE(sender_name, ?)
-                WHERE rowid = ? AND from_me IS NULL
-            """, (mk, fm, sender, s_phone, s_name, rowid))
-            if cursor.rowcount > 0:
-                fallback_enriched += 1
+                s_phone, s_name = cached_resolve_jid(sender)
+            fallback_updates.append((mk, fm, sender, s_phone, s_name, rowid))
+
+    if fallback_updates:
+        cursor.executemany("""
+            UPDATE messages SET
+                msg_key = COALESCE(msg_key, ?),
+                from_me = ?,
+                sender_jid = COALESCE(sender_jid, ?),
+                sender_phone = COALESCE(sender_phone, ?),
+                sender_name = COALESCE(sender_name, ?)
+            WHERE rowid = ? AND from_me IS NULL
+        """, fallback_updates)
+        fallback_enriched = len(fallback_updates)
 
     conn.commit()
     log_detail(f"  Fallback enrichment (reporting+message-info): {fallback_enriched} messages")
@@ -3276,10 +3360,10 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
                 chat_jid = chat_jid or safe_str(first.get("target_chat_jid"))
                 if chat_jid:
                     chat_name = chat_names.get(chat_jid)
-                    chat_phone, resolved_name = resolve_jid(chat_jid, lid_to_phone, lid_to_name)
+                    chat_phone, resolved_name = cached_resolve_jid(chat_jid)
                     if not chat_name and resolved_name:
                         chat_name = resolved_name
-                    sender_phone, sender_name = resolve_jid(sender_jid, lid_to_phone, lid_to_name) if sender_jid else (None, None)
+                    sender_phone, sender_name = cached_resolve_jid(sender_jid) if sender_jid else (None, None)
                     body_status = classify_body_status(
                         text=first.get("new_text"),
                         msg_type="chat",
@@ -3439,41 +3523,37 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
     # ── Enrich quoted-message bodies from originals in the same chat ───────
     # Newer WhatsApp exports often omit quotedMsg.body, but the original row is
     # usually present. Fill the denormalized quote preview for future DBs.
+    quote_body_changes_before = conn.total_changes
     cursor.execute("""
-        UPDATE messages AS q
-        SET quoted_msg_body = (
-                SELECT o.text
-                FROM messages AS o
-                WHERE o.chat_jid = q.chat_jid
-                  AND o.msg_id = q.quoted_stanza_id
-                  AND o.text IS NOT NULL
-                  AND TRIM(o.text) != ''
-                ORDER BY o.timestamp ASC, o.rowid ASC
-                LIMIT 1
-            ),
-            quoted_msg_type = COALESCE(
-                quoted_msg_type,
-                (
-                    SELECT o.msg_type
-                    FROM messages AS o
-                    WHERE o.chat_jid = q.chat_jid
-                      AND o.msg_id = q.quoted_stanza_id
-                    ORDER BY o.timestamp ASC, o.rowid ASC
-                    LIMIT 1
-                )
+        WITH original_quotes AS (
+            SELECT chat_jid, msg_id, text, msg_type
+            FROM (
+                SELECT
+                    chat_jid,
+                    msg_id,
+                    text,
+                    msg_type,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY chat_jid, msg_id
+                        ORDER BY timestamp ASC, rowid ASC
+                    ) AS rn
+                FROM messages
+                WHERE msg_id IS NOT NULL
+                  AND text IS NOT NULL
+                  AND TRIM(text) != ''
             )
-        WHERE q.quoted_stanza_id IS NOT NULL
+            WHERE rn = 1
+        )
+        UPDATE messages AS q
+        SET quoted_msg_body = original_quotes.text,
+            quoted_msg_type = COALESCE(q.quoted_msg_type, original_quotes.msg_type)
+        FROM original_quotes
+        WHERE q.chat_jid = original_quotes.chat_jid
+          AND q.quoted_stanza_id = original_quotes.msg_id
+          AND q.quoted_stanza_id IS NOT NULL
           AND (q.quoted_msg_body IS NULL OR TRIM(q.quoted_msg_body) = '')
-          AND EXISTS (
-              SELECT 1
-              FROM messages AS o
-              WHERE o.chat_jid = q.chat_jid
-                AND o.msg_id = q.quoted_stanza_id
-                AND o.text IS NOT NULL
-                AND TRIM(o.text) != ''
-          )
     """)
-    quote_body_fixed = cursor.rowcount
+    quote_body_fixed = conn.total_changes - quote_body_changes_before
     conn.commit()
     log_detail(f"  Quote body enrichment: {quote_body_fixed} replies filled from original messages")
 
@@ -3482,12 +3562,18 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
     # rows with the same text and timestamp can be real evidence.
     cursor.execute("""
         DELETE FROM messages
-        WHERE msg_key IS NOT NULL
-          AND rowid NOT IN (
-            SELECT MIN(rowid)
-            FROM messages
-            WHERE msg_key IS NOT NULL
-            GROUP BY msg_key
+        WHERE rowid IN (
+            SELECT m.rowid
+            FROM messages AS m
+            JOIN (
+                SELECT msg_key, MIN(rowid) AS keep_rowid
+                FROM messages
+                WHERE msg_key IS NOT NULL
+                GROUP BY msg_key
+                HAVING COUNT(*) > 1
+            ) AS duplicates
+              ON m.msg_key = duplicates.msg_key
+             AND m.rowid != duplicates.keep_rowid
         )
     """)
     deduped1 = cursor.rowcount
@@ -3506,34 +3592,32 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
         log_detail("  fromMe coverage: N/A (0 messages)")
 
     # ── Message receipts ──────────────────────────────────────────────────
-    receipt_attempted = 0
-    receipt_inserted = 0
+    receipt_batch = []
     for mi in idb_data.get('message-info', []):
         mk = safe_str(mi.get('msgKey'))
         recv_jid = safe_str(mi.get('receiverUserJid'))
         if not mk or not recv_jid:
             continue
 
-        recv_phone, recv_name = resolve_jid(recv_jid, lid_to_phone, lid_to_name)
+        recv_phone, recv_name = cached_resolve_jid(recv_jid)
         delivery = safe_int(mi.get('delivery'))
         read = safe_int(mi.get('read'))
         played = safe_int(mi.get('played'))
 
-        cursor.execute("""
+        receipt_batch.append((mk, recv_jid, recv_phone, recv_name, delivery, read, played))
+
+    if receipt_batch:
+        execute_many_counting(cursor, """
             INSERT OR IGNORE INTO message_receipts
             (msg_key, receiver_jid, receiver_phone, receiver_name,
              delivery_time, read_time, played_time)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (mk, recv_jid, recv_phone, recv_name, delivery, read, played))
-        receipt_attempted += 1
-        receipt_inserted += max(0, cursor.rowcount)
+        """, receipt_batch, "message_receipt_insert")
 
     conn.commit()
-    record_collision("message_receipt_insert", receipt_attempted, receipt_inserted)
 
     # ── Reactions ─────────────────────────────────────────────────────────
-    reaction_attempted = 0
-    reaction_inserted = 0
+    reaction_batch = []
     for rxn in idb_data.get('reactions', []):
         parent = safe_str(rxn.get('parentMsgKey'))
         sender = safe_str(rxn.get('senderUserJid'))
@@ -3543,19 +3627,19 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
         if not parent or not sender:
             continue
 
-        s_phone, s_name = resolve_jid(sender, lid_to_phone, lid_to_name)
+        s_phone, s_name = cached_resolve_jid(sender)
 
-        cursor.execute("""
+        reaction_batch.append((parent, sender, s_phone, s_name, text, ts))
+
+    if reaction_batch:
+        execute_many_counting(cursor, """
             INSERT OR IGNORE INTO reactions
             (parent_msg_key, sender_jid, sender_phone, sender_name,
              reaction_text, timestamp)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (parent, sender, s_phone, s_name, text, ts))
-        reaction_attempted += 1
-        reaction_inserted += max(0, cursor.rowcount)
+        """, reaction_batch, "reaction_insert")
 
     conn.commit()
-    record_collision("reaction_insert", reaction_attempted, reaction_inserted)
 
     # ── Final stats ───────────────────────────────────────────────────────
     cursor.execute("SELECT COUNT(*) FROM messages")
@@ -3638,22 +3722,23 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
 def iter_local_media_files(case_root):
     """Yield local media-like files already present in a copied WAren6 case."""
     case_root = pathlib.Path(case_root)
-    roots = [
-        case_root / "sessions",
-        case_root / "EBWebView_Default" / "IndexedDB",
-    ]
+    roots = []
+    sessions_root = case_root / "sessions"
+    if sessions_root.exists():
+        roots.extend(path for path in sessions_root.glob("*/transfers") if path.is_dir())
+        direct_transfers = sessions_root / "transfers"
+        if direct_transfers.is_dir():
+            roots.append(direct_transfers)
+    indexeddb_root = case_root / "EBWebView_Default" / "IndexedDB"
+    if indexeddb_root.exists():
+        roots.extend(path for path in indexeddb_root.glob("*.indexeddb.blob") if path.is_dir())
     skipped_suffixes = {
         ".db", ".db-wal", ".db-shm", ".log", ".ldb", ".txt", ".json",
         ".manifest", ".current",
     }
     for root in roots:
-        if not root.exists():
-            continue
         for file_path in root.rglob("*"):
             if not file_path.is_file():
-                continue
-            parts = {p.lower() for p in file_path.parts}
-            if "transfers" not in parts and "indexeddb.blob" not in str(file_path).lower():
                 continue
             if file_path.suffix.lower() in skipped_suffixes:
                 continue
@@ -4706,6 +4791,8 @@ def main():
         str(idb_path), str(decrypted_dir),
         runtime_store8_supplement=runtime_store8_supplement,
     )
+    if args.with_media_index:
+        print("  [>] Indexing local media files; this hashes copied evidence media...")
     media_index_report = index_local_media_assets(
         output,
         decrypted_dir,

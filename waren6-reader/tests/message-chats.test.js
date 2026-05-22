@@ -14,7 +14,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 test('numeric WhatsApp groups with missing chat_name stay in Groups, not Channels', () => {
     const chat = {
-        chat_jid: '120363424823211291@g.us',
+        chat_jid: 'fixturegroup@g.us',
         chat_name: null,
         chat_phone: null,
         is_group: true,
@@ -41,7 +41,7 @@ test('newsletter chats are channels only when the DB or JID says newsletter', ()
 
 test('chat display name prefers group subject supplied by backend', () => {
     const chat = {
-        chat_jid: '120363424823211291@g.us',
+        chat_jid: 'fixturegroup@g.us',
         chat_name: 'Example Study Group',
         chat_phone: null,
     };

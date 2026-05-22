@@ -1,5 +1,6 @@
 import contextlib
 import io
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -51,6 +52,148 @@ class UnifiedSchemaPerformanceTests(unittest.TestCase):
             self.assertIn("idx_messages_chat_msgid_ts", plan)
         finally:
             conn.close()
+
+    def test_schema_indexes_runtime_validation_by_message_key(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(waren6.UNIFIED_SCHEMA)
+            indexes = {
+                row[1]
+                for row in conn.execute("PRAGMA index_list(messages)").fetchall()
+            }
+            self.assertIn("idx_messages_msg_key", indexes)
+
+            plan = "\n".join(
+                str(row)
+                for row in conn.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT text, store8_decrypted_text
+                    FROM messages
+                    WHERE msg_key = ?
+                    LIMIT 1
+                    """,
+                    ("false_0@c.us_STANZA",),
+                ).fetchall()
+            )
+
+            self.assertIn("idx_messages_msg_key", plan)
+        finally:
+            conn.close()
+
+    def test_schema_indexes_chat_timestamp_pagination(self):
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(waren6.UNIFIED_SCHEMA)
+            indexes = {
+                row[1]
+                for row in conn.execute("PRAGMA index_list(messages)").fetchall()
+            }
+            self.assertIn("idx_messages_chat_ts", indexes)
+
+            plan = "\n".join(
+                str(row)
+                for row in conn.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT rowid
+                    FROM messages
+                    WHERE chat_jid = ?
+                      AND (timestamp < ? OR (timestamp = ? AND rowid < ?))
+                    ORDER BY timestamp DESC, rowid DESC
+                    LIMIT 50
+                    """,
+                    ("12345@c.us", 1770000000, 1770000000, 99),
+                ).fetchall()
+            )
+
+            self.assertIn("idx_messages_chat_ts", plan)
+        finally:
+            conn.close()
+
+    def test_unified_builder_defers_indexes_until_after_message_bulk_load(self):
+        source = Path(waren6.__file__).read_text(encoding="utf-8")
+        build_start = source.index("def build_unified_db")
+        build_end = source.index("def iter_local_media_files", build_start)
+        build_source = source[build_start:build_end]
+
+        self.assertIn("UNIFIED_TABLE_SCHEMA", source)
+        self.assertIn("UNIFIED_INDEX_SCHEMA", source)
+        self.assertIn("def create_unified_indexes", source)
+        self.assertIn("cursor.executescript(UNIFIED_TABLE_SCHEMA)", build_source)
+        self.assertIn("create_unified_indexes(conn)", build_source)
+        self.assertNotIn("cursor.executescript(UNIFIED_SCHEMA)", build_source)
+        self.assertLess(
+            build_source.index("cursor.executescript(UNIFIED_TABLE_SCHEMA)"),
+            build_source.index("execute_many_counting(cursor, message_insert_sql, idb_batch"),
+        )
+        self.assertLess(
+            build_source.index("execute_many_counting(cursor, message_insert_sql, idb_batch"),
+            build_source.index("create_unified_indexes(conn)"),
+        )
+
+    def test_unified_builder_uses_bulk_load_pragmas_for_generated_db(self):
+        source = Path(waren6.__file__).read_text(encoding="utf-8")
+
+        self.assertIn("def configure_unified_output_connection", source)
+        self.assertIn("PRAGMA journal_mode=MEMORY", source)
+        self.assertIn("PRAGMA synchronous=OFF", source)
+        self.assertIn("PRAGMA temp_store=MEMORY", source)
+        self.assertIn("PRAGMA mmap_size=268435456", source)
+        self.assertIn("configure_unified_output_connection(conn)", source)
+
+    def test_unifier_caches_repeated_jid_and_chat_id_parsing(self):
+        source = Path(waren6.__file__).read_text(encoding="utf-8")
+        build_start = source.index("def build_unified_db")
+        build_end = source.index("def iter_local_media_files", build_start)
+        build_source = source[build_start:build_end]
+
+        self.assertIn("import functools", source)
+        self.assertIn("@functools.lru_cache(maxsize=16384)", source)
+        self.assertIn("def _normalize_chat_id_cached", source)
+        self.assertIn("def cached_resolve_jid", build_source)
+        raw_resolve_calls = re.findall(r"(?<!cached_)resolve_jid\(", build_source)
+        self.assertEqual(len(raw_resolve_calls), 1)
+        self.assertIn("cached_resolve_jid(", build_source)
+
+    def test_unifier_batches_receipts_and_reactions(self):
+        source = Path(waren6.__file__).read_text(encoding="utf-8")
+        receipt_start = source.index("# ── Message receipts")
+        reaction_start = source.index("# ── Reactions", receipt_start)
+        final_start = source.index("# ── Final stats", reaction_start)
+        receipt_source = source[receipt_start:reaction_start]
+        reaction_source = source[reaction_start:final_start]
+
+        self.assertIn("receipt_batch", receipt_source)
+        self.assertIn("execute_many_counting(cursor", receipt_source)
+        self.assertNotIn("cursor.execute(\"\"\"", receipt_source)
+        self.assertIn("reaction_batch", reaction_source)
+        self.assertIn("execute_many_counting(cursor", reaction_source)
+        self.assertNotIn("cursor.execute(\"\"\"", reaction_source)
+
+    def test_unifier_uses_set_based_quote_and_dedup_sql(self):
+        source = Path(waren6.__file__).read_text(encoding="utf-8")
+        quote_start = source.index("# ── Enrich quoted-message bodies")
+        dedup_start = source.index("# ── Deduplicate only stable IndexedDB key duplicates", quote_start)
+        summary_start = source.index("# Summary", dedup_start)
+        quote_source = source[quote_start:dedup_start]
+        dedup_source = source[dedup_start:summary_start]
+
+        self.assertIn("ROW_NUMBER() OVER", quote_source)
+        self.assertIn("FROM original_quotes", quote_source)
+        self.assertNotIn("SELECT o.text", quote_source)
+        self.assertIn("HAVING COUNT(*) > 1", dedup_source)
+        self.assertNotIn("rowid NOT IN", dedup_source)
+
+    def test_media_iterator_targets_transfer_and_blob_dirs_directly(self):
+        source = Path(waren6.__file__).read_text(encoding="utf-8")
+        iterator_start = source.index("def iter_local_media_files")
+        iterator_end = source.index("def _case_relative", iterator_start)
+        iterator_source = source[iterator_start:iterator_end]
+
+        self.assertIn('sessions_root.glob("*/transfers")', iterator_source)
+        self.assertIn('indexeddb_root.glob("*.indexeddb.blob")', iterator_source)
+        self.assertNotIn('case_root / "sessions",', iterator_source)
 
     def test_wal_open_uses_caller_specific_sanity_tables(self):
         source = Path(waren6.__file__).read_text(encoding="utf-8")
@@ -314,7 +457,7 @@ class BodyStatusTests(unittest.TestCase):
     def test_runtime_only_revoked_rows_are_preserved_without_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "unified_whatsapp.db"
-            runtime_key = "false_120363@g.us_DELETE_999@lid"
+            runtime_key = "false_fixturegroup@g.us_DELETE_999@lid"
             runtime = {
                 "summary": {"enabled": True, "path": "runtime.jsonl", "usable_records": 1},
                 "records_by_msg_key": {
@@ -324,7 +467,7 @@ class BodyStatusTests(unittest.TestCase):
                         "type": "revoked",
                         "subtype": "sender",
                         "from_me": False,
-                        "chat_jid": "120363@g.us",
+                        "chat_jid": "fixturegroup@g.us",
                         "sender_jid": "999@lid",
                     }
                 },
@@ -365,8 +508,8 @@ class BodyStatusTests(unittest.TestCase):
     def test_runtime_only_quote_context_is_preserved_and_enriched(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "unified_whatsapp.db"
-            original_key = "false_120363@g.us_ORIG_111@lid"
-            reply_key = "false_120363@g.us_REPLY_222@lid"
+            original_key = "false_fixturegroup@g.us_ORIG_111@lid"
+            reply_key = "false_fixturegroup@g.us_REPLY_222@lid"
             runtime = {
                 "summary": {"enabled": True, "path": "runtime.jsonl", "usable_records": 2},
                 "records_by_msg_key": {
@@ -375,7 +518,7 @@ class BodyStatusTests(unittest.TestCase):
                         "timestamp": 1770000000,
                         "type": "chat",
                         "from_me": False,
-                        "chat_jid": "120363@g.us",
+                        "chat_jid": "fixturegroup@g.us",
                         "sender_jid": "111@lid",
                         "body": "original body",
                     },
@@ -384,7 +527,7 @@ class BodyStatusTests(unittest.TestCase):
                         "timestamp": 1770000010,
                         "type": "chat",
                         "from_me": False,
-                        "chat_jid": "120363@g.us",
+                        "chat_jid": "fixturegroup@g.us",
                         "sender_jid": "222@lid",
                         "body": "reply body",
                         "quoted_stanza_id": "ORIG",
@@ -530,8 +673,8 @@ class BodyStatusTests(unittest.TestCase):
     def test_orphan_message_edit_protocol_recovers_single_target_message(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "unified_whatsapp.db"
-            target_key = "false_120363@g.us_TARGET_111@lid"
-            edit_key = "false_120363@g.us_EDIT_111@lid"
+            target_key = "false_fixturegroup@g.us_TARGET_111@lid"
+            edit_key = "false_fixturegroup@g.us_EDIT_111@lid"
 
             waren6.build_unified_db(
                 str(db_path),
@@ -575,7 +718,7 @@ class BodyStatusTests(unittest.TestCase):
         self.assertEqual(recovered, (
             target_key,
             "TARGET",
-            "120363@g.us",
+            "fixturegroup@g.us",
             "recovered edited text",
             "store8_message_edit_orphan",
             1,
@@ -633,7 +776,7 @@ class BodyStatusTests(unittest.TestCase):
     def test_message_mentions_schema_extracts_store8_mentions(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "unified_whatsapp.db"
-            msg_key = "false_120363@g.us_MSG_222@lid"
+            msg_key = "false_fixturegroup@g.us_MSG_222@lid"
 
             waren6.build_unified_db(
                 str(db_path),
@@ -699,7 +842,7 @@ class BodyStatusTests(unittest.TestCase):
     def test_runtime_only_mentions_are_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "unified_whatsapp.db"
-            runtime_key = "false_120363@g.us_REPLY_222@lid"
+            runtime_key = "false_fixturegroup@g.us_REPLY_222@lid"
             runtime = {
                 "summary": {"enabled": True, "path": "runtime.jsonl", "usable_records": 1},
                 "records_by_msg_key": {
@@ -708,7 +851,7 @@ class BodyStatusTests(unittest.TestCase):
                         "timestamp": 1770000010,
                         "type": "chat",
                         "from_me": False,
-                        "chat_jid": "120363@g.us",
+                        "chat_jid": "fixturegroup@g.us",
                         "sender_jid": "222@lid",
                         "body": "@910000000002 hello",
                         "mentioned_jids": ["910000000002@s.whatsapp.net"],
@@ -744,7 +887,7 @@ class BodyStatusTests(unittest.TestCase):
     def test_group_metadata_subject_updates_chat_display_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "unified_whatsapp.db"
-            group_jid = "120363424823211291@g.us"
+            group_jid = "fixturegroup@g.us"
 
             waren6.build_unified_db(
                 str(db_path),

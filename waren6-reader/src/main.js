@@ -2227,15 +2227,22 @@ async function hydrateParticipantNameCache(messages) {
     );
     if (!missing.length) return;
 
-    await Promise.all(missing.map(async (jid) => {
-        try {
-            const resolved = await invoke('resolve_participant_name', { jid });
-            cacheParticipantResolution(jid, resolved);
-        } catch (err) {
-            cacheParticipantResolution(jid, null);
-            debugLog('Failed to resolve participant', jid, err);
+    try {
+        const rows = await invoke('resolve_participant_names', { jids: missing });
+        const returned = new Set();
+        for (const row of rows || []) {
+            const jid = row?.input_jid;
+            if (!jid) continue;
+            cacheParticipantResolution(jid, row.resolved || null);
+            returned.add(jid);
         }
-    }));
+        for (const jid of missing) {
+            if (!returned.has(jid)) cacheParticipantResolution(jid, null);
+        }
+    } catch (err) {
+        for (const jid of missing) cacheParticipantResolution(jid, null);
+        debugLog('Failed to resolve participants', err);
+    }
 }
 
 function cachedParticipantLabel(jid) {

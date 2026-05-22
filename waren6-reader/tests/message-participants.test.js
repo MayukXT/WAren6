@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 import {
     inferMentionsFromText,
@@ -37,6 +40,14 @@ test('extracts participant candidates from mentions and jid text', () => {
         '250848017924129@lid',
         '15550101234@s.whatsapp.net',
     ]);
+});
+
+test('chat paging batches participant-name backend hydration', () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const source = readFileSync(join(here, '..', 'src', 'main.js'), 'utf8');
+
+    assert.match(source, /resolve_participant_names/);
+    assert.doesNotMatch(source, /Promise\.all\(missing\.map\([\s\S]*resolve_participant_name/);
 });
 
 test('infers visible group mentions from member names and all tag', () => {

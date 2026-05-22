@@ -52,6 +52,24 @@ class PowerShellRuntimeCaptureTests(unittest.TestCase):
         self.assertIn("Start-Sleep -Seconds 3", source)
         self.assertIn("Runtime JS evaluation failed", source)
 
+    def test_runtime_capture_uses_bulk_jsonl_handoff(self):
+        source = self._source()
+        expression = self._runtime_expression()
+
+        self.assertIn('messages_jsonl: messages.join("\\n")', expression)
+        self.assertIn("$payload.messages_jsonl", source)
+        self.assertIn("$writer.Write($payload.messages_jsonl)", source)
+
+    def test_silent_runtime_launch_does_not_block_for_full_window_hide_period(self):
+        source = self._source()
+        function_start = source.index("function Invoke-WAren6WhatsAppRuntimeLaunch")
+        function_end = source.index("function Get-WAren6RuntimeExpression", function_start)
+        launch_source = source[function_start:function_end]
+
+        self.assertIn("Hide-WAren6WhatsAppWindows", launch_source)
+        self.assertIn("Start-Sleep -Milliseconds", launch_source)
+        self.assertNotIn("Hide-WAren6WhatsAppWindowsForPeriod -Seconds 8", launch_source)
+
 
 if __name__ == "__main__":
     unittest.main()

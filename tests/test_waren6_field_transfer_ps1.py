@@ -139,7 +139,8 @@ class PowerShellFieldTransferTests(unittest.TestCase):
         self.assertNotIn("Write-Verbose $WhatsAppPath", source)
         self.assertIn("Write-Verbose $verboseSourcePath", source)
         self.assertIn('Write-Verbose "Copying $verboseSourcePath to $verboseOutputPath"', source)
-        self.assertIn("$pythonOutput = & $pythonExe @pythonArgs 2>&1", source)
+        self.assertRegex(source, r"\$pythonArgs\s*=\s*@\([\s\S]{0,60}\"-u\"")
+        self.assertIn("& $pythonExe @pythonArgs 2>&1 | ForEach-Object", source)
         self.assertIn('Protect-WAren6PathText -Text ([string]$line) -CaseRoot $targetOutput', source)
         self.assertIn("Write-Warning \"  [X] waren6.py exited with error code: $pythonExitCode\"", source)
         self.assertIn('"--no-progress"', source)
@@ -156,9 +157,45 @@ class PowerShellFieldTransferTests(unittest.TestCase):
         self.assertNotIn('Write-Error "Error during copy operation: $($_.Exception.Message)"', source)
         self.assertIn("/NJH", source)
         self.assertIn("/NJS", source)
+        self.assertIn("/MT:8", source)
         self.assertIn("$robocopyOutput = & robocopy.exe @robocopyArgs 2>&1", source)
         self.assertIn("Protect-WAren6PathText -Text ([string]$line) -CaseRoot $global:targetOutput", source)
         self.assertNotIn('Start-Process -FilePath "robocopy.exe"', source)
+
+    def test_large_case_paths_avoid_duplicate_recursive_hash_passes(self):
+        source = self.source
+
+        self.assertIn("function Get-WAren6FileInventory", source)
+        self.assertIn("[System.Collections.Generic.List[object]]::new()", source)
+        self.assertNotIn("$items += [PSCustomObject]@", source)
+        self.assertIn("[object[]]$PrecomputedFiles", source)
+        self.assertIn("[object]$ArchiveInfo", source)
+        self.assertRegex(source, r"Get-WAren6FileInventory\s+-RootPath\s+\$caseRoot\s+-ExcludeRelativePaths\s+@\(\"WAren6\.manifest\.json\"\)")
+        self.assertRegex(source, r"Write-WAren6Manifest[\s\S]{0,420}-PrecomputedFiles\s+\$caseFileInventory")
+        self.assertRegex(source, r"Get-SHA256Checksum\s+-FilePath\s+\$archivePath\s+-Sha256Hash\s+\$archiveInfo\.Sha256")
+        self.assertNotIn("$copiedFiles = Get-ChildItem -Path $Destination -Recurse -Force -File", source)
+        self.assertIn("Select-Object -First 1", source)
+
+    def test_archive_and_manifest_hashing_have_dotnet_fallback(self):
+        source = self.source
+
+        self.assertIn("function Get-WAren6FileSha256Hex", source)
+        self.assertIn("[System.Security.Cryptography.SHA256]::Create()", source)
+        self.assertIn("Get-WAren6FileSha256Hex -Path $_.FullName", source)
+        self.assertIn("Get-WAren6FileSha256Hex -Path $archivePath", source)
+        self.assertIn("Get-WAren6FileSha256Hex -Path $FilePath", source)
+
+    def test_unify_later_helper_does_not_force_media_indexing(self):
+        source = self.source
+        function_start = source.index("function Write-WAren6UnifyLater")
+        function_end = source.index("function Invoke-WAren6Unify", function_start)
+        helper_source = source[function_start:function_end]
+
+        self.assertIn("[switch]$WithMedia", helper_source)
+        self.assertIn("$mediaFlag", helper_source)
+        self.assertIn("-WithMedia:$WithMedia", source)
+        self.assertNotIn('--unify `"$CasePath`" --with-media-index', helper_source)
+        self.assertNotIn('--unify `"$ArchivePath`" --with-media-index', helper_source)
 
     def test_runtime_capture_has_best_effort_close_guard(self):
         source = self.source
@@ -174,6 +211,20 @@ class PowerShellFieldTransferTests(unittest.TestCase):
         self.assertRegex(source, r"Invoke-WAren6RuntimeStore8Capture\s+-OutputDirectory\s+\$runtimeCaptureRoot\s+-Silent:\$runtimeHidden\s+-BlockClose:\$ForegroundRuntime")
         self.assertRegex(source, r"Invoke-WAren6RuntimeStore8Capture\s+-OutputDirectory\s+\$CasePath\s+-Silent:\$runtimeHidden\s+-BlockClose:\$ForegroundRuntime")
 
+    def test_acquisition_logs_substep_timing_and_waits_for_lock_release(self):
+        source = self.source
+        acquisition_start = source.index("+-- [1/4] Acquisition & File Verification")
+        acquisition_end = source.index("+-- [2/4] Decryption Engine", acquisition_start)
+        acquisition_source = source[acquisition_start:acquisition_end]
+
+        self.assertIn("function Write-WAren6StepTiming", source)
+        self.assertIn("function Wait-WAren6DatabaseLockRelease", source)
+        self.assertIn('Write-WAren6StepTiming -Label "Runtime capture"', acquisition_source)
+        self.assertIn('Write-WAren6StepTiming -Label "LocalState copy"', acquisition_source)
+        self.assertIn('Write-WAren6StepTiming -Label "IndexedDB copy"', acquisition_source)
+        self.assertIn("Wait-WAren6DatabaseLockRelease -RootPath $WhatsAppPath", acquisition_source)
+        self.assertNotIn('Start-Sleep -Seconds 2\n        Write-WAren6Output "  [OK] File locks released', acquisition_source)
+
     def test_runtime_capture_exports_quote_context_for_live_replies(self):
         source = self.source
 
@@ -184,6 +235,8 @@ class PowerShellFieldTransferTests(unittest.TestCase):
         self.assertRegex(source, r"quotedStanzaID|quotedStanzaId")
         self.assertRegex(source, r"quotedParticipant")
         self.assertRegex(source, r"quotedMsg")
+        self.assertIn("JSON.stringify(record)", source)
+        self.assertIn("$message -is [string]", source)
 
     def test_archive_prefers_zstd_tar_with_zip_fallback_and_verification(self):
         source = self.source
