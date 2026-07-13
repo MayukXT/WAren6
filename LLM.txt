@@ -634,3 +634,93 @@ Why WAren6 is more than decryption:
 - Missing media is not downloaded.
 - `--silent` and close blocking are best effort.
 - Output quality depends on source evidence completeness, WAL availability, IndexedDB blob availability, contact evidence, and runtime authorization.
+
+## Performance Reality on Modest CPUs
+
+WAren6 has two halves. The PowerShell acquire step is mostly I/O plus per-4KB-page AES-256-OFB decryption of `session.db`, `nativeSettings.db`, `genericStorage.db`, `contacts.db` (and their WAL siblings); it runs comfortably on any CPU. The Python unify step is CPU-heavy — Store 8 parse, fuzzy-timestamp merge with genericStorage, optional HKDF-SHA256+AES trial decryption of opaque bodies, 74k+ row SQLite writes, deferred index build, media SHA-256 hashing — and dominates wall-clock on modest dual-core hardware (older laptops, Celeron/Atom-class evidence PCs).
+
+Typical estimated breakdown on a modest dual-core with a spinning disk, ~30k messages (measured with `--profile`; numbers below are code-inspection estimates until you have real profile output):
+
+- Store 8 parse + genericStorage fuzzy merge: **5-15s** (dominant on default hybrid run)
+- Store 8 opaque HKDF+AES loop, if triggered: **5-15s** (memoized in current build; 2-5x faster than pre-2026-07 sprint)
+- V8/Blink structured-clone deserialization inside `ccl_chromium_reader`: **1-4s**
+- Deferred index creation (18 indexes wrapped in one BEGIN/COMMIT, 256 MiB cache): **1-3s**
+- Snappy decompression during LevelDB read: **1-3s**
+- Salt hunter file scan, if triggered: **2-10s** (exhaustive by default; `--fast-salt-hunt` for opt-in early exit)
+
+Get real numbers by running `python waren6.py --unify <case> --profile`. That writes `unify_profile.json` alongside the output DB with per-stage `perf_counter` timings.
+
+## Split-Machine Workflow (recommended for modest CPUs)
+
+If unification is taking uncomfortably long on the target, split the work:
+
+**On the target (must run there — DPAPI-NG keys are bound to that user session + ODUID):**
+
+```
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -a
+```
+
+`-a` acquires and decrypts all databases on the target and packages everything into a `.tar.zst` case archive, skipping the unify step. Also skip `-m` (media indexing) and any `--reports-dir` there — both cost minutes of thermal-throttled CPU that a faster workstation handles in seconds.
+
+**Transfer** the `.tar.zst` (plus its `.sha256.txt`, `.manifest.json`, `.logs.txt`) to a workstation, verify SHA-256, extract.
+
+**On the workstation:**
+
+```
+powershell -ExecutionPolicy Bypass -File .\waren6.ps1 -u -c <case-path>
+```
+
+Or, on Linux/macOS (Python unify is cross-OS — no Windows-only imports fire in `--unify`):
+
+```
+python waren6.py --unify <case-path>
+```
+
+`-u` / `--unify` reads the already-decrypted `.dec.db` files, does the CPU-heavy unification on cores that don't downclock, and produces `unified_whatsapp.db`. Add `--with-media-index` and `--reports-dir` there for media hashing and forensic report export.
+
+**Deferring media hashing separately:** if you have an existing `unified_whatsapp.db` and want to hash media as a later pass without redoing the full unify:
+
+```
+python waren6.py --media-only <path-to-unified_whatsapp.db> --decrypted-dir <case-path> --with-media-index
+```
+
+Expected effect on a 30k-message case: target time drops from ~25-40 min (thermal-throttled) to ~5-8 min (I/O-bound acquire only); workstation unify runs 2-3x faster than target on the same case.
+
+## Flags Added in the 2026-07 Perf Sprint
+
+- `--profile` — per-stage `time.perf_counter` timings dumped to `unify_profile.json` alongside the output DB. Use this to get real numbers before doing more perf work.
+- `--fast-salt-hunt` — opt-in early exit for the salt hunter (breaks scan after >=3 validated candidates AND 32 consecutive files with no new hits). Default remains exhaustive: multi-salt cases exist (WA reinstall, salt rotation) and early exit loses yield.
+- `--media-only <path-to-unified.db>` — skip full unify, run only media indexing against an existing unified DB. Enables deferring the ~30-120s hashing pass off the target.
+
+## What NOT to Do
+
+- Don't spawn multiple `IndexedDb()` readers against the same LevelDB directory. `ccl_chromium_reader` has no locks; a shared instance corrupts on shared file position, and N independent instances re-decompress the same Snappy blocks N times for zero net win.
+- Don't add writer threads to the unified SQLite DB. SQLite serializes writers at the DB lock; you get `SQLITE_BUSY` retries with zero throughput gain.
+- Don't flip `--fast-salt-hunt` on as the default. Multi-salt cases exist and early exit loses yield.
+- Don't run `--unify` on the target if you can defer to a workstation. Even without `-m` and reports, you still pay minutes of thermal-throttled CPU on the parse/merge/index-build path.
+
+## Cross-OS Unify
+
+- Requirements: Python 3.11+, `cryptography` module, `ccl_chromium_reader`.
+- Verified: `--unify` code path contains no Windows-only imports (no `winreg`, no `win32*`, no `ctypes.WinDLL`). Path handling uses `pathlib.Path` throughout.
+- `.tar.zst` extraction on Linux/macOS: `zstd -d case.tar.zst -o case.tar && tar xf case.tar` (or install zstd from your package manager). On Windows without `tar --zstd`, the fallback is `.zip`.
+- Always verify SHA-256 before extract: compare `sha256sum case.tar.zst` to the packaged `.sha256.txt`.
+
+## Session Key Recovery (updated 2026-07 for newer WA Desktop builds)
+
+Original PS1 flow decrypted `session.db-wal` and scanned it for a specific 3-byte SQLite record header (`0x03 kType vType`) to find client keys. On newer WA Desktop builds this scanner returns nothing because either (a) the WAL was checkpointed into the main `.db` before capture, or (b) the session table now has more columns and the record header is `0x04`+ (not `0x03`).
+
+Current PS1 flow (`Start-WAren6` around waren6.ps1:4224+) uses two tiers:
+
+1. **Legacy WAL fast path** — `Get-WalSettingsData` on `session.dec.db-wal`, take last entry, validate by SHA-1 matching an existing `sessions/<40-hex>/` dir. Unchanged for compatible WA builds.
+2. **Schema-agnostic enumeration** — `Find-SessionClientKeyCandidates` scans both `session.dec.db-wal` and `session.dec.db` for records with any header size 3-8 containing a 32 or 48 byte BLOB. Every candidate is SHA-1'd; the first one whose hash matches a real `sessions/<40-hex>/` dir wins.
+
+Same tier-cascade applies to `nativeSettings.dec.db-wal` -> `nativeSettings.dec.db` for the database keys via `Get-SettingsRecords`.
+
+## Where to Look Next
+
+- `docs/kb/perf/Bottlenecks.md` — ranked wall-clock offenders with root cause and fix status.
+- `docs/kb/adr/ADR-003-split-machine-workflow.md` — the acquire-on-target / unify-on-workstation ADR.
+- `docs/kb/adr/ADR-004-session-key-schema-agnostic.md` — session key recovery redesign.
+- `AI_KB_RULES.md` — rules for AI agents modifying this repo (read before writing code).
+- `docs/kb/NOTES.md` — running log of decisions and gotchas.

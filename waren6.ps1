@@ -1171,11 +1171,10 @@ function ConvertFrom-WrappedAesKeyBC {
     )
 
     try {
-        # Import necessary namespaces 
-        $null = [System.Reflection.Assembly]::LoadWithPartialName("BouncyCastle.Crypto") 
-        $null = [System.Reflection.Assembly]::LoadWithPartialName("BouncyCastle.Security") 
-        # Create the cipher 
-        $cipher = [Org.BouncyCastle.Crypto.Engines.AesWrapEngine]::new() 
+        # BouncyCastle is loaded once at script entry via Add-Type -Path
+        # (see Start-WAren6). LoadWithPartialName is deprecated and was
+        # firing on every AES-KW unwrap without adding anything.
+        $cipher = [Org.BouncyCastle.Crypto.Engines.AesWrapEngine]::new()
         $cipher.Init($false, [Org.BouncyCastle.Crypto.Parameters.KeyParameter]::new($kek)) 
         # Unwrap the key 
         $unwrappedKey = $cipher.Unwrap($wrappedKey, 0, $wrappedKey.Length)
@@ -3161,19 +3160,29 @@ function Invoke-WAren6RuntimeStore8Capture {
             Disable-WAren6WhatsAppClose
         }
 
+        # Poll the WebView2 DevTools endpoint 4x/second so we exit as soon as
+        # the page is up, but keep the window-hide / block-close side work
+        # capped at 1x/second so we don't hammer WhatsApp's UI. Overall
+        # 90-second budget is preserved.
         $targets = $null
-        for ($i = 0; $i -lt 90; $i++) {
-            Start-Sleep -Seconds 1
-            if ($Silent) {
-                Hide-WAren6WhatsAppWindows
-            }
-            elseif ($BlockClose) {
-                $running = Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue
-                if (-not $running) {
-                    Write-WAren6Output "  [>] WhatsApp closed during live capture; relaunching runtime..."
-                    Invoke-WAren6WhatsAppRuntimeLaunch -Silent:$Silent
+        $page = $null
+        $deadline = [DateTime]::UtcNow.AddSeconds(90)
+        $lastMaintenanceUtc = [DateTime]::MinValue
+        while ([DateTime]::UtcNow -lt $deadline) {
+            $now = [DateTime]::UtcNow
+            if (($now - $lastMaintenanceUtc).TotalMilliseconds -ge 1000) {
+                if ($Silent) {
+                    Hide-WAren6WhatsAppWindows
                 }
-                Disable-WAren6WhatsAppClose
+                elseif ($BlockClose) {
+                    $running = Get-Process -Name "*WhatsApp*" -ErrorAction SilentlyContinue
+                    if (-not $running) {
+                        Write-WAren6Output "  [>] WhatsApp closed during live capture; relaunching runtime..."
+                        Invoke-WAren6WhatsAppRuntimeLaunch -Silent:$Silent
+                    }
+                    Disable-WAren6WhatsAppClose
+                }
+                $lastMaintenanceUtc = $now
             }
             try {
                 $targets = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/list" -TimeoutSec 2
@@ -3182,6 +3191,7 @@ function Invoke-WAren6RuntimeStore8Capture {
             }
             catch { }
             $page = $null
+            Start-Sleep -Milliseconds 250
         }
         if (-not $page) {
             throw "WhatsApp WebView2 runtime did not expose a web.whatsapp.com DevTools page."
@@ -3193,6 +3203,12 @@ function Invoke-WAren6RuntimeStore8Capture {
             Invoke-WAren6CdpMethod -Socket $socket -Id 1 -Method "Runtime.enable" | Out-Null
             $payload = $null
             $lastRuntimeException = $null
+            # Exponential backoff (500ms, 1s, 2s, 3s, 3s...) so a runtime that
+            # is nearly ready recovers in ~1s instead of the old worst case
+            # (fixed 3s per attempt regardless of readiness). Cap at 3s and
+            # 20 attempts to preserve the previous total budget.
+            $backoffMs = 500
+            $maxBackoffMs = 3000
             for ($attempt = 1; $attempt -le 20; $attempt++) {
                 $result = Invoke-WAren6CdpMethod -Socket $socket -Id (1 + $attempt) -Method "Runtime.evaluate" -Params @{
                     expression = Get-WAren6RuntimeExpression
@@ -3212,7 +3228,8 @@ function Invoke-WAren6RuntimeStore8Capture {
                     if ($attempt -ge 20) {
                         throw "Runtime JS evaluation failed: $exceptionDescription"
                     }
-                    Start-Sleep -Seconds 3
+                    Start-Sleep -Milliseconds $backoffMs
+                    $backoffMs = [Math]::Min($maxBackoffMs, $backoffMs * 2)
                     continue
                 }
                 $payload = $result.result.value
@@ -3221,7 +3238,8 @@ function Invoke-WAren6RuntimeStore8Capture {
                 if ($hasJsonlPayload -or $hasLegacyMessages) {
                     break
                 }
-                Start-Sleep -Seconds 3
+                Start-Sleep -Milliseconds $backoffMs
+                $backoffMs = [Math]::Min($maxBackoffMs, $backoffMs * 2)
             }
             $hasJsonlPayload = $payload -and $payload.messages_jsonl -and ([string]$payload.messages_jsonl).Length -gt 0
             $hasLegacyMessages = $payload -and $payload.messages -and $payload.messages.Count -gt 0
@@ -3524,6 +3542,374 @@ function Get-WalSettingsData {
     }
 
     return $results
+}
+
+function Get-SqliteRecordSizeForType {
+    <#
+    .SYNOPSIS
+    Returns the on-disk data-region byte size for a SQLite serial type varint.
+
+    Types:
+        0        NULL (0 bytes)
+        1..4     signed integers (1..4 bytes)
+        5        6-byte signed integer
+        6, 7     8-byte signed integer / double
+        8, 9     constants 0 / 1 (0 bytes)
+        10, 11   reserved (rejected)
+        N>=12    even = BLOB of size (N-12)/2, odd = TEXT of size (N-13)/2
+    Returns -1 for reserved / invalid.
+    #>
+    param([int]$TypeCode)
+    if ($TypeCode -lt 0) { return -1 }
+    if ($TypeCode -le 9) {
+        # Cheaper than a hashtable lookup in a tight loop.
+        return @(0, 1, 2, 3, 4, 6, 8, 8, 0, 0)[$TypeCode]
+    }
+    if ($TypeCode -eq 10 -or $TypeCode -eq 11) { return -1 }
+    if (($TypeCode -band 1) -eq 0) { return ($TypeCode - 12) / 2 }
+    return ($TypeCode - 13) / 2
+}
+
+function Find-SqliteBlobCandidates {
+    <#
+    .SYNOPSIS
+    Schema-agnostic byte scan for SQLite records that contain a BLOB column of
+    a chosen size. Used to enumerate WhatsApp client-key candidates from either
+    a decrypted WAL or main .db file when the exact table shape is unknown.
+
+    .DESCRIPTION
+    Rather than assume WA still uses a 2-column (integer key, blob value) table
+    with SQLite header-size 0x03 -- a shape that changes between WA Desktop
+    builds -- we scan for records with any header size in [3..8] (covers tables
+    with 2..7 columns), parse each column-type varint (1-byte varints only, as
+    all realistic type codes we care about fit in 7 bits), and if the record
+    contains a BLOB of one of the requested sizes we extract the blob bytes
+    from its true data-region offset. False positives don't matter: caller
+    validates by SHA-1 matching against existing sessions/ directory names.
+    #>
+    param(
+        [byte[]]$Bytes,
+        [int]$StartOffset = 0,
+        [int]$EndOffset = -1,
+        [int[]]$AcceptBlobSizes = @(32, 48)
+    )
+
+    if ($EndOffset -lt 0) { $EndOffset = $Bytes.Length }
+    $results = New-Object System.Collections.Generic.List[PSObject]
+    if ($EndOffset -le ($StartOffset + 4)) { return $results }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $wanted = @{}
+    foreach ($sz in $AcceptBlobSizes) {
+        # BLOB serial-type code for byte length N is (12 + 2*N).
+        $wanted[[int](12 + 2 * $sz)] = $sz
+    }
+
+    # Scan every byte offset up to a safe tail padding for the smallest blob we want.
+    $tail = ($AcceptBlobSizes | Measure-Object -Minimum).Minimum
+    $scanEnd = $EndOffset - $tail
+    for ($cursor = $StartOffset; $cursor -lt $scanEnd; $cursor++) {
+        $headerSize = $Bytes[$cursor]
+        # Only try plausible small headers. Header size varint counts itself,
+        # so header_size = 3 means 2 column-type varints follow (2-column row).
+        if ($headerSize -lt 3 -or $headerSize -gt 8) { continue }
+
+        $headerEnd = $cursor + $headerSize
+        if ($headerEnd -gt $EndOffset) { continue }
+
+        # Parse (headerSize - 1) column-type varints, single-byte only.
+        # Any high bit set means multibyte varint -> skip conservatively.
+        $colTypes = New-Object System.Collections.ArrayList
+        $valid = $true
+        for ($k = $cursor + 1; $k -lt $headerEnd; $k++) {
+            $t = [int]$Bytes[$k]
+            if ($t -gt 127) { $valid = $false; break }
+            if ($t -eq 10 -or $t -eq 11) { $valid = $false; break }
+            [void]$colTypes.Add($t)
+        }
+        if (-not $valid -or $colTypes.Count -eq 0) { continue }
+
+        # Compute cumulative column data offsets and check for a wanted blob column.
+        $sizes = New-Object System.Collections.ArrayList
+        $totalDataSize = 0
+        $hasWanted = $false
+        $rowInvalid = $false
+        foreach ($t in $colTypes) {
+            $sz = Get-SqliteRecordSizeForType -TypeCode $t
+            if ($sz -lt 0) { $rowInvalid = $true; break }
+            [void]$sizes.Add($sz)
+            if ($wanted.ContainsKey($t)) { $hasWanted = $true }
+            $totalDataSize += $sz
+        }
+        if ($rowInvalid -or -not $hasWanted) { continue }
+        if (($headerEnd + $totalDataSize) -gt $EndOffset) { continue }
+
+        # Extract each wanted-size blob from its true offset within the record.
+        $running = 0
+        for ($k = 0; $k -lt $colTypes.Count; $k++) {
+            $t = $colTypes[$k]
+            $sz = $sizes[$k]
+            if ($wanted.ContainsKey($t)) {
+                $blob = New-Object byte[] $sz
+                [Buffer]::BlockCopy($Bytes, ($headerEnd + $running), $blob, 0, $sz)
+                $hex = [BitConverter]::ToString($blob).Replace('-', '')
+                if (-not $seen.Contains($hex)) {
+                    [void]$seen.Add($hex)
+                    [void]$results.Add([PSCustomObject]@{
+                        Offset     = $cursor
+                        HeaderSize = $headerSize
+                        BlobSize   = $sz
+                        HexBlob    = $hex
+                        Blob       = $blob
+                    })
+                }
+            }
+            $running += $sz
+        }
+    }
+
+    return $results
+}
+
+function Find-SessionClientKeyCandidates {
+    <#
+    .SYNOPSIS
+    Enumerate all plausible client-key candidates from both the decrypted WAL
+    and the decrypted main .db file. Combines schema-agnostic scanner results
+    with legacy Get-WalSettingsData results so we don't regress the fast path.
+    #>
+    param(
+        [string]$WalPath,
+        [string]$DbPath
+    )
+
+    $all = New-Object System.Collections.Generic.List[PSObject]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    function Add-Candidate {
+        param([PSObject]$Cand, [string]$Source)
+        if (-not $Cand -or -not $Cand.HexBlob) { return }
+        if ($seen.Contains($Cand.HexBlob)) { return }
+        [void]$seen.Add($Cand.HexBlob)
+        $Cand | Add-Member -MemberType NoteProperty -Name Source -Value $Source -Force
+        [void]$all.Add($Cand)
+    }
+
+    # WAL scan (broadened) -- WAL frames are chronologically ordered so newest is best,
+    # but we prefer the SHA-1 dir match anyway.
+    if (Test-Path $WalPath) {
+        try {
+            $walBytes = [System.IO.File]::ReadAllBytes($WalPath)
+        } catch { $walBytes = $null }
+        if ($walBytes -and $walBytes.Length -ge 32) {
+            # Legacy fast-path scanner first (adds context we don't compute in the broad scan)
+            try {
+                $legacy = Get-WalSettingsData $WalPath
+                if ($legacy) {
+                    foreach ($rec in $legacy) {
+                        if ($rec.HexBlob -and $rec.HexBlob -ne '[NULL]') {
+                            $blob = Convert-HexStringToByteArray $rec.HexBlob
+                            if ($blob -and ($blob.Length -eq 32 -or $blob.Length -eq 48)) {
+                                Add-Candidate ([PSCustomObject]@{
+                                    Offset     = -1
+                                    HeaderSize = 3
+                                    BlobSize   = $blob.Length
+                                    HexBlob    = $rec.HexBlob
+                                    Blob       = $blob
+                                }) 'wal_legacy'
+                            }
+                        }
+                    }
+                }
+            } catch { }
+            # Broad scan starting past the 32-byte WAL file header.
+            $broad = Find-SqliteBlobCandidates -Bytes $walBytes -StartOffset 32
+            foreach ($c in $broad) { Add-Candidate $c 'wal_broad' }
+        }
+    }
+
+    # Main .db scan -- scan past the 100-byte SQLite file header.
+    if (Test-Path $DbPath) {
+        try {
+            $dbBytes = [System.IO.File]::ReadAllBytes($DbPath)
+        } catch { $dbBytes = $null }
+        if ($dbBytes -and $dbBytes.Length -ge 100) {
+            $broad = Find-SqliteBlobCandidates -Bytes $dbBytes -StartOffset 100
+            foreach ($c in $broad) { Add-Candidate $c 'main_db' }
+        }
+    }
+
+    return $all
+}
+
+function Find-SqliteSettingsRecords {
+    <#
+    .SYNOPSIS
+    Schema-agnostic scan for SQLite records that pair a small integer key
+    (0..10) with a 16..64 byte BLOB (or a NULL blob column). Returned rows
+    are shaped identically to Get-WalSettingsData so downstream callers work
+    unchanged. Used to keep nativeSettings key discovery robust when the WA
+    Desktop settings table grows extra columns and the legacy header==0x03
+    scan misses everything.
+    #>
+    param(
+        [byte[]]$Bytes,
+        [int]$StartOffset = 0,
+        [int]$EndOffset = -1
+    )
+
+    if ($EndOffset -lt 0) { $EndOffset = $Bytes.Length }
+    $results = New-Object System.Collections.Generic.List[PSObject]
+    if ($EndOffset -le ($StartOffset + 4)) { return $results }
+
+    for ($cursor = $StartOffset; $cursor -lt ($EndOffset - 3); $cursor++) {
+        $headerSize = $Bytes[$cursor]
+        if ($headerSize -lt 3 -or $headerSize -gt 8) { continue }
+
+        $headerEnd = $cursor + $headerSize
+        if ($headerEnd -gt $EndOffset) { continue }
+
+        $colTypes = New-Object System.Collections.ArrayList
+        $valid = $true
+        for ($k = $cursor + 1; $k -lt $headerEnd; $k++) {
+            $t = [int]$Bytes[$k]
+            if ($t -gt 127) { $valid = $false; break }
+            if ($t -eq 10 -or $t -eq 11) { $valid = $false; break }
+            [void]$colTypes.Add($t)
+        }
+        if (-not $valid -or $colTypes.Count -lt 2) { continue }
+
+        $sizes = New-Object System.Collections.ArrayList
+        $totalDataSize = 0
+        $rowInvalid = $false
+        foreach ($t in $colTypes) {
+            $sz = Get-SqliteRecordSizeForType -TypeCode $t
+            if ($sz -lt 0) { $rowInvalid = $true; break }
+            [void]$sizes.Add($sz)
+            $totalDataSize += $sz
+        }
+        if ($rowInvalid) { continue }
+        if (($headerEnd + $totalDataSize) -gt $EndOffset) { continue }
+
+        # Find a small-integer key column and a plausible-blob (or NULL) value column.
+        $keyColIdx = -1
+        $blobColIdx = -1
+        $blobSize = 0
+        $blobIsNull = $false
+        for ($k = 0; $k -lt $colTypes.Count; $k++) {
+            $t = $colTypes[$k]
+            if ($keyColIdx -eq -1 -and ($t -eq 1 -or $t -eq 8 -or $t -eq 9)) {
+                $keyColIdx = $k
+            }
+            elseif ($blobColIdx -eq -1) {
+                if ($t -eq 0) {
+                    $blobColIdx = $k
+                    $blobIsNull = $true
+                    $blobSize = 0
+                }
+                elseif ($t -ge 12 -and ($t -band 1) -eq 0) {
+                    $sz = ($t - 12) / 2
+                    if ($sz -ge 16 -and $sz -le 64) {
+                        $blobColIdx = $k
+                        $blobSize = $sz
+                        $blobIsNull = $false
+                    }
+                }
+            }
+        }
+        if ($keyColIdx -eq -1 -or $blobColIdx -eq -1) { continue }
+
+        $keyDataOffset = 0
+        for ($k = 0; $k -lt $keyColIdx; $k++) { $keyDataOffset += $sizes[$k] }
+        $keyType = $colTypes[$keyColIdx]
+        $keyVal = $null
+        if ($keyType -eq 8) { $keyVal = 0 }
+        elseif ($keyType -eq 9) { $keyVal = 1 }
+        elseif ($keyType -eq 1) {
+            $keyVal = [int][sbyte]$Bytes[$headerEnd + $keyDataOffset]
+        }
+        if ($null -eq $keyVal -or $keyVal -lt 0 -or $keyVal -gt 10) { continue }
+
+        $blobDataOffset = 0
+        for ($k = 0; $k -lt $blobColIdx; $k++) { $blobDataOffset += $sizes[$k] }
+
+        $blobHex = ""
+        $status = ""
+        if ($blobIsNull) {
+            $blobHex = "[NULL]"
+            $status = "Null"
+        }
+        else {
+            $blob = New-Object byte[] $blobSize
+            [Buffer]::BlockCopy($Bytes, ($headerEnd + $blobDataOffset), $blob, 0, $blobSize)
+            $blobHex = [BitConverter]::ToString($blob).Replace('-', '')
+            $status = "$blobSize bytes"
+        }
+
+        [void]$results.Add([PSCustomObject]@{
+            Frame   = "off$cursor"
+            Key     = $keyVal
+            Status  = $status
+            HexBlob = $blobHex
+            DBPage  = 0
+        })
+    }
+
+    return $results
+}
+
+function Get-SettingsRecords {
+    <#
+    .SYNOPSIS
+    Read (key, blob) settings records from a decrypted WAL or main .db file.
+    Cascades: legacy Get-WalSettingsData first (fast path, unchanged behavior
+    for WA builds still using the 2-column shape). If it returns nothing,
+    falls back to Find-SqliteSettingsRecords which handles multi-column
+    tables. Callers get the same object shape either way.
+    #>
+    param(
+        [string]$FilePath,
+        [switch]$IsWal
+    )
+
+    if (-not (Test-Path $FilePath)) { return @() }
+
+    if ($IsWal) {
+        try { $records = Get-WalSettingsData $FilePath } catch { $records = $null }
+        if ($records -and $records.Count -gt 0) { return $records }
+    }
+
+    try { $bytes = [System.IO.File]::ReadAllBytes($FilePath) } catch { return @() }
+    if (-not $bytes) { return @() }
+
+    $startOffset = if ($IsWal) { 32 } else { 100 }
+    if ($bytes.Length -le $startOffset) { return @() }
+
+    return Find-SqliteSettingsRecords -Bytes $bytes -StartOffset $startOffset
+}
+
+function Test-ClientKeyAgainstSessionsDir {
+    <#
+    .SYNOPSIS
+    Compute SHA-1(clientKey) as uppercase hex and return the matching session
+    directory name if one exists under $SessionsRoot, else $null.
+    Schema-agnostic validation of a candidate client key.
+    #>
+    param(
+        [byte[]]$ClientKey,
+        [string]$SessionsRoot
+    )
+    if (-not $ClientKey -or $ClientKey.Length -eq 0) { return $null }
+    if (-not (Test-Path $SessionsRoot)) { return $null }
+    $sha1 = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        $hashBytes = $sha1.ComputeHash($ClientKey)
+        $dirName = [BitConverter]::ToString($hashBytes).Replace('-', '')
+        $path = Join-Path $SessionsRoot $dirName
+        if (Test-Path $path) { return $dirName }
+        return $null
+    } finally {
+        $sha1.Dispose()
+    }
 }
 
 function Protect-WebView2Secret {
@@ -3977,29 +4363,114 @@ public class ClipcWrapper {
         catch { Write-Error "Failed to decrypt session.db: $($_.Exception.Message)"; return }
         
         Write-WAren6Output "  [>] Reading decrypted session WAL settings..."
-        $clientKeyList = Get-WalSettingsData $targetOutput"\session.dec.db-wal"
-        
-        # Validate clientKeyList
-        if (-not $clientKeyList -or $clientKeyList.Count -eq 0) {
-            Write-Error "CRITICAL: No client keys found in session.dec.db-wal."
-            Write-Error "The WAL file may be empty or in an unexpected format."
-            return
+        $sessionsRoot = "$targetOutput\sessions"
+        $sessionWalPath = "$targetOutput\session.dec.db-wal"
+        $sessionDbPath = "$targetOutput\session.dec.db"
+
+        # Two-tier recovery:
+        #   Tier 1 (fast path, unchanged for legacy WA builds):
+        #     - Get-WalSettingsData scans the WAL for the classic 0x03 header shape.
+        #     - Take last entry; SHA-1 must match an existing sessions/ dir to be valid.
+        #   Tier 2 (schema-agnostic fallback for newer WA builds):
+        #     - Find-SessionClientKeyCandidates enumerates ALL 32/48-byte blob candidates
+        #       from the WAL and main .db across any 2..7 column table shape.
+        #     - Each candidate is SHA-1'd and validated against sessions/ dir names.
+        #     - First candidate whose hash matches a real session dir wins.
+        # The sessions/ dir name is SHA-1(clientKey) on disk -- that's the ground truth,
+        # so matching against it is schema-agnostic and rejects false-positive blobs.
+        $clientKey = $null
+        $targetSession = $null
+        $clientKeySource = $null
+        $tier1Report = ""
+
+        # Tier 1: legacy WAL fast path
+        try { $legacyList = Get-WalSettingsData $sessionWalPath } catch { $legacyList = $null }
+        if ($legacyList -and $legacyList.Count -gt 0) {
+            $tier1Report = "WAL legacy scanner: $($legacyList.Count) record(s)."
+            # Try the last entry first (chronological newest in WAL), then walk backwards.
+            for ($idx = $legacyList.Count - 1; $idx -ge 0; $idx--) {
+                $entry = $legacyList[$idx]
+                if (-not $entry -or [string]::IsNullOrWhiteSpace($entry.HexBlob) -or $entry.HexBlob -eq '[NULL]') { continue }
+                $candidate = Convert-HexStringToByteArray $entry.HexBlob
+                if (-not $candidate) { continue }
+                if ($candidate.Length -ne 32 -and $candidate.Length -ne 48) { continue }
+                $matchedDir = Test-ClientKeyAgainstSessionsDir -ClientKey $candidate -SessionsRoot $sessionsRoot
+                if ($matchedDir) {
+                    $clientKey = $candidate
+                    $targetSession = $matchedDir
+                    $clientKeySource = "wal_legacy_entry_$idx"
+                    Write-WAren6Output "  [OK] Client key recovered from session WAL (legacy, entry $idx) -- matches sessions/$matchedDir"
+                    break
+                }
+            }
         }
-        
-        $lastEntry = $clientKeyList[-1]
-        if (-not $lastEntry -or [string]::IsNullOrWhiteSpace($lastEntry.HexBlob) -or $lastEntry.HexBlob -eq '[NULL]') {
-            Write-Error "CRITICAL: Last client key entry has no valid blob data."
-            return
+        else {
+            $tier1Report = "WAL legacy scanner: 0 records (WAL likely checkpointed or format changed)."
         }
-        
-        $clientKey = Convert-HexStringToByteArray $lastEntry.HexBlob
-        Write-WAren6Output "  [OK] Client key recovered from session WAL."
-        
-        #Session dir
-        $sha1 = [System.Security.Cryptography.SHA1]::Create()
-        $hashBytes = $sha1.ComputeHash($clientKey)
-        $targetSession = [BitConverter]::ToString($hashBytes).Replace('-', '') 
+        if (-not $clientKey) {
+            Write-WAren6Output "  [!] $tier1Report"
+        }
+
+        # Tier 2: schema-agnostic enumeration + SHA-1 match against sessions/ dir names
+        if (-not $clientKey) {
+            Write-WAren6Output "  [>] Enumerating client-key candidates from WAL + main DB (schema-agnostic scan)..."
+            $sessionDirs = @(Get-ChildItem -Path $sessionsRoot -Directory -Force -ErrorAction SilentlyContinue |
+                             Where-Object { $_.Name -match '^[0-9A-Fa-f]{40}$' } |
+                             Select-Object -ExpandProperty Name)
+            if ($sessionDirs.Count -eq 0) {
+                Write-Error "CRITICAL: sessions/ has no valid SHA-1 session directories to match against."
+                Write-Error "  sessions root: $sessionsRoot"
+                Write-Error "  This means WhatsApp has never fully signed in on this machine, or the copy is incomplete."
+                return
+            }
+            $sessionDirSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($d in $sessionDirs) { [void]$sessionDirSet.Add($d) }
+            Write-WAren6Output "  [>] Target sessions/ dirs to match: $($sessionDirs -join ', ')"
+
+            $candidates = Find-SessionClientKeyCandidates -WalPath $sessionWalPath -DbPath $sessionDbPath
+            Write-WAren6Output "  [>] Enumerated $($candidates.Count) unique 32/48-byte blob candidate(s)."
+
+            $sha1Instance = [System.Security.Cryptography.SHA1]::Create()
+            try {
+                foreach ($c in $candidates) {
+                    $digest = $sha1Instance.ComputeHash($c.Blob)
+                    $digestHex = [BitConverter]::ToString($digest).Replace('-', '')
+                    if ($sessionDirSet.Contains($digestHex)) {
+                        $clientKey = $c.Blob
+                        $targetSession = $digestHex
+                        $clientKeySource = $c.Source
+                        Write-WAren6Output "  [OK] Client key recovered from $($c.Source) (offset=$($c.Offset), $($c.BlobSize)B) -- SHA-1 matches sessions/$digestHex"
+                        break
+                    }
+                }
+            } finally {
+                $sha1Instance.Dispose()
+            }
+
+            if (-not $clientKey) {
+                # Full diagnostic dump so we can debug the exact schema shift on this WA build.
+                Write-Error "CRITICAL: No client key found matching any sessions/ directory."
+                $walInfo = Get-Item $sessionWalPath -ErrorAction SilentlyContinue
+                $dbInfo = Get-Item $sessionDbPath -ErrorAction SilentlyContinue
+                Write-Error ("  session.dec.db-wal: {0} bytes" -f ($(if ($walInfo) { $walInfo.Length } else { 'missing' })))
+                Write-Error ("  session.dec.db:     {0} bytes" -f ($(if ($dbInfo) { $dbInfo.Length } else { 'missing' })))
+                Write-Error "  sessions/ dirs ($($sessionDirs.Count)): $($sessionDirs -join ', ')"
+                Write-Error "  Tier1: $tier1Report"
+                Write-Error "  Tier2: $($candidates.Count) candidate blob(s) enumerated, none matched any session dir's SHA-1."
+                if ($candidates.Count -gt 0) {
+                    Write-Error "  Sample candidates (first 8): source | size | offset | first-16-hex"
+                    foreach ($c in ($candidates | Select-Object -First 8)) {
+                        $preview = $c.HexBlob.Substring(0, [Math]::Min(16, $c.HexBlob.Length))
+                        Write-Error ("    {0,-12} | {1,3}B | off={2,-8} | {3}..." -f $c.Source, $c.BlobSize, $c.Offset, $preview)
+                    }
+                }
+                Write-Error "  If the decrypted files look intact, preserve them (redacted or otherwise) so we can teach the scanner the new record shape."
+                return
+            }
+        }
+
         Write-WAren6Output "  [>] Session directory: $targetSession"
+        Write-WAren6Output "  [>] Client-key source: $clientKeySource"
         
         #DB files
         $publisherKey = $ODUID.ID 
@@ -4063,8 +4534,15 @@ public class ClipcWrapper {
         else { Write-Warning "nativeSettings.db not found - skipping." }
 
         
-        $databaseKeyList = Get-WalSettingsData "$workingDir\nativeSettings.dec.db-wal"
-        
+        $databaseKeyList = Get-SettingsRecords -FilePath "$workingDir\nativeSettings.dec.db-wal" -IsWal
+        if (-not $databaseKeyList -or $databaseKeyList.Count -eq 0) {
+            Write-WAren6Output "  [!] nativeSettings.dec.db-wal yielded no records (checkpointed or format changed)."
+            Write-WAren6Output "  [>] Falling back to nativeSettings.dec.db main file..."
+            $databaseKeyList = Get-SettingsRecords -FilePath "$workingDir\nativeSettings.dec.db"
+        }
+        if ($databaseKeyList -and $databaseKeyList.Count -gt 0) {
+            Write-WAren6Output "  [>] nativeSettings records recovered: $($databaseKeyList.Count) row(s)"
+        }
 
         if ($databaseKeyList) {
             # Group key records for key types 1, 2, and 3.

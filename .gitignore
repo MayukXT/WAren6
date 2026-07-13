@@ -57,6 +57,7 @@ venv/
 # Local scratch
 /Scripts/
 binaries/
+graphify-out/
 *.bak*
 *_stitch.html
 *.local

@@ -49,8 +49,13 @@ class PowerShellRuntimeCaptureTests(unittest.TestCase):
 
         self.assertIn("$result.exceptionDetails", source)
         self.assertIn("$lastRuntimeException", source)
-        self.assertIn("Start-Sleep -Seconds 3", source)
         self.assertIn("Runtime JS evaluation failed", source)
+        # The runtime capture retry loop must still sleep between attempts
+        # (exponential backoff, capped at $maxBackoffMs). We assert on the
+        # variable name so the loop can be re-tuned without churning tests,
+        # but the sleep-per-attempt contract is preserved.
+        self.assertIn("Start-Sleep -Milliseconds $backoffMs", source)
+        self.assertIn("$maxBackoffMs", source)
 
     def test_runtime_capture_uses_bulk_jsonl_handoff(self):
         source = self._source()

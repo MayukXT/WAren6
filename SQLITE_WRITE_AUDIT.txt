@@ -1,0 +1,203 @@
+SQLite Write Pattern Audit - waren6.py
+================================================================================
+
+## 1. CONNECTION MANAGEMENT
+
+sqlite3.connect() call sites:
+  waren6.py:2487 — Main unified DB (single connection, REUSED across entire pipeline)
+  waren6.py:3765 — Media indexing (separate function)
+  waren6.py:4006 — Validation report (read-only)
+  waren6.py:4507 — Chat summary report (read-only)
+
+PATTERN: Single reused connection for all unification writes.
+
+================================================================================
+
+## 2. EXECUTEMANY vs EXECUTE-IN-LOOP
+
+GOOD (executemany bulk writes - 11 sites):
+
+1. waren6.py:2596 — extraction_metadata (~15 rows)
+2. waren6.py:3045 — messages (IndexedDB, ~30k rows)
+3. waren6.py:3144 — messages (runtime supplement, ~1k rows)
+4. waren6.py:3152 — message_mentions (~15k rows)
+5. waren6.py:3221 — messages (FTS fallback, ~2k rows)
+6. waren6.py:3278 — UPDATE messages (fallback enrichment, ~1k)
+7. waren6.py:3517 — extraction_metadata (~5 rows)
+8. waren6.py:3616 — message_receipts (~3k rows)
+9. waren6.py:3641 — reactions (~2k rows)
+10. waren6.py:3875 — media_assets (~3k rows)
+11. waren6.py:3885 — UPDATE messages (media links, ~3k)
+
+ACCEPTABLE (individual execute loops - small scale):
+
+waren6.py:2611-2615 — Per-contact INSERT (~1k rows)
+waren6.py:2670-2681 — Per-chat INSERT (~80 rows)
+waren6.py:2694-2704 — Per-group INSERT (~40 rows)
+waren6.py:2743-2752 — Per-participant INSERT (~300 rows)
+waren6.py:3319-3343 — Per-edit INSERT (~50 rows)
+
+VERDICT: Bulk writes use executemany (good). Small-scale <10k use execute loops 
+(acceptable). No risky patterns found.
+
+================================================================================
+
+## 3. PRAGMA SETTINGS
+
+All in configure_unified_output_connection() lines 354-359:
+
+  PRAGMA journal_mode=MEMORY
+  PRAGMA synchronous=OFF
+  PRAGMA temp_store=MEMORY
+  PRAGMA cache_size=-131072 (128 MB)
+  PRAGMA mmap_size=268435456 (256 MB)
+  PRAGMA locking_mode=EXCLUSIVE
+
+Assessment: Aggressively tuned for single-pass bulk load. Optimal.
+
+================================================================================
+
+## 4. EXPLICIT BEGIN / COMMIT WRAPPING
+
+BEGIN statements: ZERO found
+
+Commits: 29 sites (many small transactions)
+  Lines: 2651, 2683, 2727, 2760, 3046, 3143, 3158, 3222, 3289, 3299, 3515, 
+         3527, 3563, 3586, 3623, 3648, 3704, 3778, 3906, 3933, etc.
+
+ISSUE: 29 small commits = transaction overhead for each
+OPTIMAL: Single BEGIN...COMMIT around entire unify() function
+
+================================================================================
+
+## 5. CREATE INDEX STATEMENTS
+
+Location: waren6.py:115-298 in schema
+
+All indexes defined in UNIFIED_INDEX_SCHEMA (line 344)
+Created AFTER bulk inserts (line 3225) via create_unified_indexes(conn)
+
+Total indexes: 18
+  - 2 on contacts
+  - 9 on messages (chat, chat_ts, msg_key, msgid_ts, etc.)
+  - 2 on media_assets
+  - 1 on reactions
+  - 1 on message_mentions
+  - 2 on message_edits
+  - 1 on group_participants
+
+VERDICT: ✅ OPTIMAL — Deferred indexing avoids 10-100x slowdown from 
+         per-row index maintenance during bulk inserts.
+
+================================================================================
+
+## 6. INSERT OR REPLACE / INSERT OR IGNORE
+
+INSERT OR IGNORE (forensic rows - safe):
+  Messages (2522), groups in chats (2709), participants (2744), 
+  mentions (3152), receipts (3617), reactions (3641)
+
+INSERT OR REPLACE (metadata/contact updates - safe):
+  extraction_metadata (2597, 3518), contacts (2612), chats (2671), 
+  groups (2695)
+
+VERDICT: Appropriate usage. IGNORE for evidence, REPLACE for metadata.
+
+================================================================================
+
+## 7. SQLITE3.ROW FACTORY / LARGE MATERIALIZATIONS
+
+Potential risks:
+
+waren6.py:2769-2771 — fetchall() chat lookup (~200 rows) ACCEPTABLE
+waren6.py:3263 — fetchall() for enrichment (~1k rows) ACCEPTABLE
+waren6.py:3676 — fetchall() for stats (~10 rows) ACCEPTABLE
+
+No Row factory used. No large materializations.
+
+VERDICT: ✅ No problematic patterns.
+
+================================================================================
+
+## 8. AUTOCOMMIT STATE
+
+SQLite3 Python: isolation_level unset (implicit transactions)
+Current: Explicit commits via 29 separate commit() calls
+
+VERDICT: Acceptable. Could optimize with single BEGIN...COMMIT.
+
+================================================================================
+
+## 9. DELETE + INSERT ANTI-PATTERNS
+
+Deduplication at line 3569-3584:
+  DELETE FROM messages WHERE rowid IN (SELECT...) [~0-2k rows]
+
+This is legitimate cleanup, not anti-pattern.
+
+VERDICT: ✅ No DELETE+INSERT anti-patterns.
+
+================================================================================
+
+## WRITE-COST ESTIMATE
+
+Typical hybrid run (~74k total writes):
+  20k messages (Store 8)
+  1k messages (runtime)
+  2k messages (FTS)
+  1k message UPDATEs (enrichment)
+  500 message UPDATEs (edits)
+  15k mentions
+  3k receipts
+  2k reactions
+  3k media assets
+  3k message UPDATEs (media)
+  1.3k contacts/chats/groups/participants
+
+SQL calls: ~100-120 explicit statements
+
+Bottlenecks (by impact):
+
+1. BATCH COMMITS (~30% improvement)
+   Save: 28 transaction overheads
+   Est. impact: 3-5 seconds
+
+2. SMALL-SCALE LOOPS (~10% improvement)
+   Batch 1.4k individual executes into 5-10 batches
+   Est. impact: 1-2 seconds
+
+3. MESSAGE EDIT LOOP (~5% improvement)
+   Batch ~50 individual edits
+   Est. impact: 200-300 ms
+
+4. JID CACHING (~15% improvement, not SQL)
+   Pre-fetch all JIDs instead of live resolution
+   Est. impact: 2-3 seconds
+
+5. Index timing: Already optimal (no change)
+
+================================================================================
+
+## SUMMARY
+
+Strengths:
+  ✅ Bulk inserts use executemany() for 20k+ rows
+  ✅ Indexes deferred until after bulk inserts (major win)
+  ✅ Memory-mapped I/O + in-memory journal (good for single-pass)
+  ✅ INSERT OR IGNORE for forensic rows (safe)
+  ✅ No large fetchall() materializations
+  ✅ No DELETE+INSERT anti-patterns
+  ✅ Appropriate PRAGMA tuning
+
+Issues:
+  ⚠️ 29 small commits instead of 1 large transaction
+  ⚠️ Small-scale rows still use per-row execute()
+
+Recommendations (priority order):
+  1. Wrap unify() in single BEGIN...COMMIT (3-5s save)
+  2. Batch contact/chat/group inserts (1-2s save)
+  3. Optimize JID resolution caching (2-3s save, not SQL)
+  4. Batch message edits (200-300ms save)
+
+Overall: Good foundation, modest improvements possible.
+

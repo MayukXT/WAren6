@@ -18,6 +18,7 @@ Usage:
 import argparse
 import base64
 import binascii
+import concurrent.futures
 import csv
 import datetime
 import functools
@@ -344,8 +345,42 @@ UNIFIED_TABLE_SCHEMA, UNIFIED_INDEX_SCHEMA = split_unified_schema(UNIFIED_SCHEMA
 
 
 def create_unified_indexes(conn):
-    """Create query indexes after bulk inserts to avoid per-row index churn."""
-    conn.executescript(UNIFIED_INDEX_SCHEMA)
+    """Create query indexes after bulk inserts to avoid per-row index churn.
+
+    Wraps all 18 CREATE INDEX statements in one BEGIN/COMMIT so the pager
+    cache stays warm across statements — journal_mode=MEMORY is already
+    the writer default, so this is a cache-locality win, not an fsync win.
+    Temporarily raises PRAGMA cache_size to 256 MiB for the index build,
+    then restores the caller's 128 MiB default. Safe: the bump only lives
+    for this call and only touches page-cache size, not durability.
+    """
+    prior_cache_size = None
+    try:
+        row = conn.execute("PRAGMA cache_size").fetchone()
+        if row is not None:
+            prior_cache_size = row[0]
+    except sqlite3.Error:
+        prior_cache_size = None
+    try:
+        conn.execute("PRAGMA cache_size=-262144")  # 256 MiB, temporary
+    except sqlite3.Error:
+        pass
+    in_txn_before = getattr(conn, "in_transaction", False)
+    try:
+        # executescript issues its own COMMIT before running, so any pending
+        # writes from the caller are flushed first. Then we open one fresh
+        # transaction around every CREATE INDEX statement.
+        conn.executescript("BEGIN;\n" + UNIFIED_INDEX_SCHEMA + "\nCOMMIT;\n")
+    finally:
+        if prior_cache_size is not None:
+            try:
+                conn.execute(f"PRAGMA cache_size={int(prior_cache_size)}")
+            except sqlite3.Error:
+                pass
+        # If caller was mid-transaction before we entered, restore that
+        # state by opening a fresh implicit transaction on next write.
+        # sqlite3 handles this automatically on the next execute().
+        _ = in_txn_before  # kept for readability; no explicit action needed
 
 
 def configure_unified_output_connection(conn):
@@ -609,13 +644,21 @@ class Store8CryptoContext:
     artifact_inventory: dict = field(default_factory=dict)
 
 
-def hkdf_sha256(ikm, salt, info=b"", length=16):
-    """RFC 5869 HKDF-SHA256."""
-    ikm = _coerce_bytes(ikm) or b""
-    salt = _coerce_bytes(salt) or bytes(hashlib.sha256().digest_size)
-    info = _coerce_bytes(info) or b""
-    if length <= 0:
-        return b""
+# ─── Store 8 opaque decryption caches ────────────────────────────────────────
+# Bounded memoization for HKDF derivations and AES algorithm objects on the
+# Store 8 opaque hot path (`decrypt_store8_opaque_record`). Across ~5k opaque
+# records × 4 ikm × 3 salt × 3 info = ~180k trial derivations, only ~10-40
+# unique (ikm, salt, info, length) triples typically fire — plain dict is the
+# fastest safe cache. FIFO eviction at cap keeps memory bounded even under
+# pathological per-message salt rotation. See docs/kb/perf/Bottlenecks.md.
+_HKDF_CACHE_CAP = 4096
+_HKDF_CACHE: "dict[tuple, bytes]" = {}
+_AES_ALG_CACHE_CAP = 512
+_AES_ALG_CACHE: "dict[bytes, object]" = {}
+
+
+def _hkdf_sha256_uncached(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
+    """Pure HKDF-SHA256 derivation; assumes bytes inputs already normalized."""
     hash_len = hashlib.sha256().digest_size
     if length > 255 * hash_len:
         raise ValueError("HKDF output length is too large")
@@ -630,10 +673,63 @@ def hkdf_sha256(ikm, salt, info=b"", length=16):
     return okm[:length]
 
 
+def hkdf_sha256(ikm, salt, info=b"", length=16):
+    """RFC 5869 HKDF-SHA256 with bounded memoization on (ikm, salt, info, length)."""
+    ikm = _coerce_bytes(ikm) or b""
+    salt = _coerce_bytes(salt) or bytes(hashlib.sha256().digest_size)
+    info = _coerce_bytes(info) or b""
+    if length <= 0:
+        return b""
+    key = (ikm, salt, info, length)
+    hit = _HKDF_CACHE.get(key)
+    if hit is not None:
+        return hit
+    derived = _hkdf_sha256_uncached(ikm, salt, info, length)
+    if len(_HKDF_CACHE) >= _HKDF_CACHE_CAP:
+        # FIFO eviction: drop oldest insertion. Preserves dict ordering
+        # semantics (Python 3.7+) without pulling in OrderedDict.
+        try:
+            _HKDF_CACHE.pop(next(iter(_HKDF_CACHE)))
+        except StopIteration:
+            pass
+    _HKDF_CACHE[key] = derived
+    return derived
+
+
+def _get_cached_aes_algorithm(key: bytes):
+    """Reuse `cryptography` algorithms.AES(key) objects; the algorithm object
+    is safe to share across independent CBC decryptor instances."""
+    try:
+        from cryptography.hazmat.primitives.ciphers import algorithms
+    except ImportError:
+        return None
+    cached = _AES_ALG_CACHE.get(key)
+    if cached is not None:
+        return cached
+    alg = algorithms.AES(key)
+    if len(_AES_ALG_CACHE) >= _AES_ALG_CACHE_CAP:
+        try:
+            _AES_ALG_CACHE.pop(next(iter(_AES_ALG_CACHE)))
+        except StopIteration:
+            pass
+    _AES_ALG_CACHE[key] = alg
+    return alg
+
+
+def reset_store8_opaque_caches():
+    """Test/diagnostic hook: clear HKDF + AES-algorithm caches."""
+    _HKDF_CACHE.clear()
+    _AES_ALG_CACHE.clear()
+
+
 def _aes_backend_decrypt(ciphertext, key, iv):
     try:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        decryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
+        from cryptography.hazmat.primitives.ciphers import Cipher, modes
+        alg = _get_cached_aes_algorithm(key)
+        if alg is None:
+            from cryptography.hazmat.primitives.ciphers import algorithms
+            alg = algorithms.AES(key)
+        decryptor = Cipher(alg, modes.CBC(iv)).decryptor()
         return decryptor.update(ciphertext) + decryptor.finalize()
     except ImportError:
         try:
@@ -1049,8 +1145,18 @@ def hunt_store8_network_salts(
     max_file_bytes=25 * 1024 * 1024,
     max_candidates=500,
     probe_limit=8,
+    fast_mode=False,
+    fast_min_validated=3,
+    fast_dry_files=32,
 ):
-    """Scan offline artifacts for salt candidates and accept only verified ones."""
+    """Scan offline artifacts for salt candidates and accept only verified ones.
+
+    fast_mode: opt-in early exit. Off by default because multi-salt cases exist
+    (WA reinstall, salt rotation) and dropping later candidates loses yield.
+    When on: break the outer file loop once we have `fast_min_validated`
+    validated candidates AND have scanned `fast_dry_files` consecutive files
+    without a new validated hit.
+    """
     report = {
         "schema": "waren6.store8-salt-hunt.v1",
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1063,6 +1169,8 @@ def hunt_store8_network_salts(
             "validated_candidates": 0,
             "probe_messages": 0,
             "blocked": None,
+            "fast_mode": bool(fast_mode),
+            "early_exit": False,
         },
         "candidates": [],
         "validated": [],
@@ -1080,9 +1188,11 @@ def hunt_store8_network_salts(
 
     seen_candidates = {sha256_bytes(c["value"]) for c in context.salt_candidates if c.get("value")}
     accepted_hashes = set(seen_candidates)
+    dry_files_streak = 0
 
     for file_path in _iter_salt_hunter_files(search_paths, max_files=max_files, max_file_bytes=max_file_bytes):
         report["summary"]["files_scanned"] += 1
+        validated_before_file = report["summary"]["validated_candidates"]
         try:
             data = file_path.read_bytes()
         except OSError as exc:
@@ -1136,6 +1246,21 @@ def hunt_store8_network_salts(
                 break
         if report["summary"]["candidate_values"] >= max_candidates:
             break
+
+        if fast_mode:
+            gained = report["summary"]["validated_candidates"] - validated_before_file
+            if gained > 0:
+                dry_files_streak = 0
+            else:
+                dry_files_streak += 1
+            if (report["summary"]["validated_candidates"] >= fast_min_validated
+                    and dry_files_streak >= fast_dry_files):
+                report["summary"]["early_exit"] = True
+                report["summary"]["early_exit_reason"] = (
+                    f"fast_mode: >={fast_min_validated} validated candidates and "
+                    f"{dry_files_streak} consecutive files with no new hits"
+                )
+                break
 
     if not report["summary"]["validated_candidates"]:
         report["summary"]["blocked"] = "no_valid_network_salt_found"
@@ -1824,6 +1949,7 @@ def extract_indexeddb(
     decrypt_store8_opaque=False,
     hunt_opaque_salt=False,
     opaque_artifact_paths=None,
+    fast_salt_hunt=False,
 ):
     """Read WhatsApp IndexedDB and return extracted data dicts."""
     require_ccl_reader()
@@ -1938,6 +2064,7 @@ def extract_indexeddb(
             salt_hunt_paths,
             data.get('message', []),
             crypto_context,
+            fast_mode=bool(fast_salt_hunt),
         )
         salt_hunt_report["enabled"] = True
         if salt_hunt_report.get("summary", {}).get("validated_candidates"):
@@ -3445,6 +3572,15 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
     )
     variant_keys = [row[0] for row in cursor.fetchall()]
     variant_revision_count = 0
+    # Prefetch existing message_edits counts once instead of running a
+    # SELECT COUNT(*) per target_key inside the loop below.
+    existing_edit_counts = {
+        row[0]: row[1]
+        for row in cursor.execute(
+            "SELECT target_msg_key, COUNT(*) FROM message_edits "
+            "WHERE target_msg_key IS NOT NULL GROUP BY target_msg_key"
+        ).fetchall()
+    }
     for target_key in variant_keys:
         rows = cursor.execute(
             """
@@ -3459,11 +3595,7 @@ def build_unified_db(output_path, idb_data, sqlite_messages, lid_to_phone,
             continue
         base = rows[0]
         previous_text = base[4]
-        existing_count = sqlite_scalar(
-            conn,
-            "SELECT COUNT(*) FROM message_edits WHERE target_msg_key = ?",
-            (target_key,),
-        )
+        existing_count = existing_edit_counts.get(target_key, 0)
         for offset, row in enumerate(rows[1:], start=1):
             text_variant = row[4]
             if (text_variant or "") == (previous_text or ""):
@@ -3798,8 +3930,9 @@ def index_local_media_assets(db_path, case_root, enabled=True):
                 "mime": mime,
             })
 
-        files_indexed = 0
-        assets_linked = 0
+        # Dedup pass first (cheap: resolve() + set membership). We hash and
+        # match after this so we never SHA-256 the same physical file twice.
+        distinct_files = []
         seen_files = set()
         for file_path in iter_local_media_files(case_root):
             try:
@@ -3809,46 +3942,82 @@ def index_local_media_assets(db_path, case_root, enabled=True):
             if resolved in seen_files:
                 continue
             seen_files.add(resolved)
+            distinct_files.append(file_path)
+
+        # Parallel SHA-256: hashlib releases the GIL inside .update(), so
+        # threads scale linearly on multi-core boxes without the memory
+        # overhead of a process pool. Cap at 4 to stay friendly on modest
+        # dual-core boxes (older laptops, low-power field-kit hardware).
+        def _stat_and_hash(path):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                return None
+            try:
+                digest = sha256_file(path)
+            except OSError:
+                return None
+            return (path, size, digest)
+
+        worker_count = max(1, min(4, os.cpu_count() or 1))
+        hashed_entries = []
+        if distinct_files:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
+                for entry in pool.map(_stat_and_hash, distinct_files):
+                    if entry is not None:
+                        hashed_entries.append(entry)
+
+        # Build the write buffers in a single deterministic pass, then flush
+        # with executemany so we take one B-tree traversal per (INSERT|UPDATE)
+        # batch instead of one per row.
+        files_indexed = 0
+        assets_linked = 0
+        insert_rows = []
+        update_rows = []
+        for file_path, size, digest in hashed_entries:
             files_indexed += 1
             filename = file_path.name
-            size = file_path.stat().st_size
-            digest = sha256_file(file_path)
             rel = _case_relative(file_path, case_root)
             mime = mimetypes.guess_type(filename)[0]
             matches = by_filename.get(filename.lower()) or [None]
             for match in matches:
-                conn.execute(
-                    """
-                    INSERT INTO media_assets
-                    (msg_key, chat_jid, original_path, case_relative_path, filename,
-                     mime_type, size, sha256, acquisition_method, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        match.get("msg_key") if match else None,
-                        match.get("chat_jid") if match else None,
-                        str(file_path),
-                        rel,
-                        filename,
-                        match.get("mime") if match and match.get("mime") else mime,
-                        size,
-                        digest,
-                        "local_case_file",
-                        "local_present" if match else "unlinked_local_file",
-                    ),
-                )
+                insert_rows.append((
+                    match.get("msg_key") if match else None,
+                    match.get("chat_jid") if match else None,
+                    str(file_path),
+                    rel,
+                    filename,
+                    match.get("mime") if match and match.get("mime") else mime,
+                    size,
+                    digest,
+                    "local_case_file",
+                    "local_present" if match else "unlinked_local_file",
+                ))
                 if match:
-                    conn.execute(
-                        """
-                        UPDATE messages
-                        SET media_case_path = COALESCE(media_case_path, ?),
-                            media_sha256 = COALESCE(media_sha256, ?),
-                            media_status = 'local_present'
-                        WHERE rowid = ?
-                        """,
-                        (rel, digest, match["rowid"]),
-                    )
+                    update_rows.append((rel, digest, match["rowid"]))
                     assets_linked += 1
+
+        if insert_rows:
+            conn.executemany(
+                """
+                INSERT INTO media_assets
+                (msg_key, chat_jid, original_path, case_relative_path, filename,
+                 mime_type, size, sha256, acquisition_method, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                insert_rows,
+            )
+        if update_rows:
+            conn.executemany(
+                """
+                UPDATE messages
+                SET media_case_path = COALESCE(media_case_path, ?),
+                    media_sha256 = COALESCE(media_sha256, ?),
+                    media_status = 'local_present'
+                WHERE rowid = ?
+                """,
+                update_rows,
+            )
 
         conn.execute(
             """
@@ -4637,6 +4806,12 @@ def main():
         '--store8-salt-hunt-report',
         help='Output path for store8_salt_hunt_report.json')
     parser.add_argument(
+        '--fast-salt-hunt',
+        action='store_true',
+        help=('Opt-in early exit for the salt hunter: stop scanning once >=3 '
+              'validated candidates found AND 32 consecutive files produced no new hits. '
+              'Default is exhaustive (multi-salt cases exist: WA reinstall, salt rotation).'))
+    parser.add_argument(
         '--runtime-store8-jsonl',
         help='Live-runtime Store 8 JSONL supplement produced by tools/wa_live_runtime_capture.js')
     parser.add_argument(
@@ -4646,6 +4821,16 @@ def main():
     parser.add_argument(
         '--media-index-report',
         help='Output path for media_index_report.json')
+    parser.add_argument(
+        '--media-only',
+        help=('Skip full unification and only run media indexing against an existing '
+              'unified_whatsapp.db at this path. Enables deferring media hashing off '
+              'the target to a more powerful machine after the archive transfer.'))
+    parser.add_argument(
+        '--profile',
+        action='store_true',
+        help=('Emit per-stage wall-clock timings into WAren6.manifest.json (unify_profile '
+              'section) and also write unify_profile.json alongside the output DB.'))
 
     args = parser.parse_args()
     global PROGRESS_ENABLED, VERBOSE_CONSOLE
@@ -4725,18 +4910,73 @@ def main():
     print("|        WAren6 WhatsApp Forensic Data Extractor             |")
     print("+------------------------------------------------------------+")
 
+    # --profile: collect per-stage perf_counter timings. Uses perf_counter (monotonic)
+    # rather than time.time so backwards clock adjustments during acquisition don't
+    # skew the profile.
+    stage_profile = [] if args.profile else None
+
+    def _record_stage(name, wall_seconds, extra=None):
+        if stage_profile is None:
+            return
+        entry = {"stage": name, "seconds": round(float(wall_seconds), 4)}
+        if extra:
+            entry.update(extra)
+        stage_profile.append(entry)
+
     overall_start = time.time()
+    overall_perf_start = time.perf_counter()
+
+    # --media-only: run only media indexing against an existing unified_whatsapp.db.
+    # Enables deferring the ~30-120s media hashing pass off the target to a faster
+    # workstation after the .tar.zst archive transfer.
+    if args.media_only:
+        media_only_db = pathlib.Path(args.media_only)
+        if not media_only_db.exists():
+            parser.error(f"--media-only DB not found: {media_only_db}")
+        media_only_case_root = pathlib.Path(args.decrypted_dir) if args.decrypted_dir else media_only_db.parent
+        print(f"\n[1/1] Media-only indexing against {media_only_db}...")
+        t_media_only = time.perf_counter()
+        media_index_report = index_local_media_assets(
+            str(media_only_db),
+            media_only_case_root,
+            enabled=True,
+        )
+        _record_stage("media_only_index", time.perf_counter() - t_media_only,
+                      {"messages_linked": media_index_report.get("messages_with_local_media", 0)})
+        if args.media_index_report or write_media_index_report:
+            report_path = args.media_index_report or str(media_only_db.with_name("media_index_report.json"))
+            write_json_report(report_path, media_index_report)
+            print(f"  [OK] Media index report: {report_path}")
+        print(
+            "  Media index: "
+            f"{media_index_report.get('messages_with_local_media', 0)} messages linked, "
+            f"{media_index_report.get('messages_missing_local_media', 0)} missing local files"
+        )
+        if stage_profile is not None:
+            profile_path = media_only_db.with_name("unify_profile.json")
+            write_json_report(str(profile_path), {
+                "schema": "waren6.unify-profile.v1",
+                "mode": "media-only",
+                "overall_seconds": round(time.perf_counter() - overall_perf_start, 4),
+                "stages": stage_profile,
+            })
+            print(f"  [OK] Unify profile: {profile_path}")
+        print("\n[1/1] Media-only pass complete.")
+        return
 
     # 1. Extract IndexedDB
     print("\n[1/5] Extracting IndexedDB data...")
     t0 = time.time()
+    t_perf = time.perf_counter()
     idb_data = extract_indexeddb(
         idb_path,
         opaque_salt_file=args.opaque_salt_file,
         decrypt_store8_opaque=args.decrypt_store8_opaque,
         hunt_opaque_salt=args.hunt_opaque_salt,
         opaque_artifact_paths=args.opaque_artifact_path,
+        fast_salt_hunt=args.fast_salt_hunt,
     )
+    _record_stage("extract_indexeddb", time.perf_counter() - t_perf)
     if idb_data and write_store8_debug:
         write_json_report(crypto_artifacts_report, idb_data.get("_opaque_crypto_artifacts", {}))
         write_json_report(store8_crypto_profile, idb_data.get("_store8_crypto_profile", {}))
@@ -4769,35 +5009,46 @@ def main():
     # 2. Load decrypted SQLite messages
     print("\n[2/5] Loading decrypted SQLite messages...")
     t0 = time.time()
+    t_perf = time.perf_counter()
     sqlite_messages = load_decrypted_messages(decrypted_dir)
     sqlite_contacts = load_decrypted_contacts(decrypted_dir)
+    _record_stage("load_decrypted_sqlite", time.perf_counter() - t_perf,
+                  {"messages": len(sqlite_messages), "contacts": len(sqlite_contacts)})
     print(f"  [OK] Decrypted SQLite data loaded in {time.time() - t0:.1f}s")
 
     # 3. Build LID resolver
     print("\n[3/5] Building LID resolver...")
     t0 = time.time()
+    t_perf = time.perf_counter()
     lid_to_phone, lid_to_name, phone_to_name = build_lid_resolver(
         idb_data.get('contact', []),
         sqlite_contacts
     )
+    _record_stage("build_lid_resolver", time.perf_counter() - t_perf)
     print(f"  [OK] LID resolver built in {time.time() - t0:.1f}s")
 
     # 4. Build unified database
     print("\n[4/5] Building unified database...")
     t0 = time.time()
+    t_perf = time.perf_counter()
     stats = build_unified_db(
         output, idb_data, sqlite_messages,
         lid_to_phone, lid_to_name, phone_to_name,
         str(idb_path), str(decrypted_dir),
         runtime_store8_supplement=runtime_store8_supplement,
     )
+    _record_stage("build_unified_db", time.perf_counter() - t_perf)
     if args.with_media_index:
         print("  [>] Indexing local media files; this hashes copied evidence media...")
+    t_perf = time.perf_counter()
     media_index_report = index_local_media_assets(
         output,
         decrypted_dir,
         enabled=args.with_media_index,
     )
+    _record_stage("media_index", time.perf_counter() - t_perf,
+                  {"enabled": bool(args.with_media_index),
+                   "messages_linked": media_index_report.get("messages_with_local_media", 0)})
     if write_media_index_report:
         write_json_report(media_index_report_path, media_index_report)
     if args.with_media_index:
@@ -4859,6 +5110,17 @@ def main():
 
     # 5. Summary
     overall_time = time.time() - overall_start
+    if stage_profile is not None:
+        profile_output = pathlib.Path(output).with_name("unify_profile.json")
+        write_json_report(str(profile_output), {
+            "schema": "waren6.unify-profile.v1",
+            "mode": "unify" if args.unify else "extract",
+            "output_db": str(output),
+            "overall_seconds": round(time.perf_counter() - overall_perf_start, 4),
+            "wallclock_seconds": round(overall_time, 4),
+            "stages": stage_profile,
+        })
+        print(f"  [OK] Unify profile: {profile_output}")
     print("\n[5/5] Done!")
     print("\n+------------------------------------------------------------+")
     print("|                    EXTRACTION SUMMARY                      |")
